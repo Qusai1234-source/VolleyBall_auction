@@ -1,7 +1,6 @@
 from services.supabase_client import get_supabase
 import random
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor
 
 
 def get_auction_state():
@@ -17,34 +16,26 @@ def get_auction_state():
     state["current_bid_team_id"] = state.get("current_bid_team")
     player_id = state.get("current_player_id")
 
-    # fetch player, teams, logs in parallel
-    def fetch_player():
-        if not player_id:
-            return None
+    # fetch player
+    if player_id:
         p = supabase.table("players").select("*").eq("id", player_id).single().execute().data
         if p:
             p["cls"]        = p.get("class")
             p["sold_price"] = p.get("sold_amount")
-        return p
+        state["current_player"] = p
+    else:
+        state["current_player"] = None
 
-    def fetch_teams():
-        rows = supabase.table("teams").select("*").order("name").execute().data or []
-        for t in rows:
-            t["players_bought"] = t.get("roster_count", 0)
-            t["max_players"]    = t.get("max_slots", 0)
-            t["max_wallet"]     = 200000  # fixed starting budget
-        return rows
+    # fetch teams
+    rows = supabase.table("teams").select("*").order("name").execute().data or []
+    for t in rows:
+        t["players_bought"] = t.get("roster_count", 0)
+        t["max_players"]    = t.get("max_slots", 0)
+        t["max_wallet"]     = 300000
+    state["teams"] = rows
 
-    def fetch_logs():
-        return supabase.table("action_log").select("*").order("created_at", desc=True).limit(50).execute().data or []
-
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        f_player = ex.submit(fetch_player)
-        f_teams  = ex.submit(fetch_teams)
-        f_logs   = ex.submit(fetch_logs)
-        state["current_player"] = f_player.result()
-        state["teams"]          = f_teams.result()
-        state["action_log"]     = f_logs.result()
+    # action_log not fetched here - admin fetches separately
+    state["action_log"] = []
 
     return state
 
@@ -170,18 +161,17 @@ def resolve_deadlock():
     }
 
 
-def pause_auction():
+def pause_auction(paused: bool):
     supabase = get_supabase()
 
-    # Read current state and toggle
-    state = supabase.table("auction_state").select("is_paused, current_player_id")\
-        .eq("id", 1).single().execute().data
-    paused = not state.get("is_paused", False)
-
     update = {"is_paused": paused}
+    # Also flip the phase so frontend phase checks work
     if paused:
         update["phase"] = "paused"
     else:
+        # Resume: only go back to active if a player is currently up
+        state = supabase.table("auction_state").select("current_player_id")\
+            .eq("id", 1).single().execute().data
         update["phase"] = "active" if state.get("current_player_id") else "idle"
 
     supabase.table("auction_state").update(update).eq("id", 1).execute()
@@ -191,122 +181,13 @@ def pause_auction():
         "payload": {},
     }).execute()
 
-    return {"ok": True, "paused": paused, "message": "Paused" if paused else "Resumed"}
+    return {"ok": True, "paused": paused}
 
 
 def undo_last():
-    """Undo the last auction action by reading the most recent action_log entry
-    and reversing it in Python."""
     supabase = get_supabase()
-
-    # Get the most recent action log entry
-    logs = supabase.table("action_log").select("*")\
-        .order("created_at", desc=True).limit(1).execute().data
-    if not logs:
-        return {"ok": False, "error": "Nothing to undo"}
-
-    last = logs[0]
-    action = last.get("action", "")
-    payload = last.get("payload") or {}
-
-    try:
-        if action == "player_sold":
-            # Reverse a sale: restore player to active, refund team wallet, decrement roster
-            pid = payload.get("player_id")
-            tid = payload.get("team_id")
-            amt = payload.get("amount", 0)
-            if pid:
-                supabase.table("players").update({
-                    "status": "active", "sold_to_team": None, "sold_amount": None,
-                }).eq("id", pid).execute()
-            if tid:
-                # Refund wallet and decrement roster_count
-                team = supabase.table("teams").select("wallet, roster_count")\
-                    .eq("id", tid).single().execute().data
-                if team:
-                    supabase.table("teams").update({
-                        "wallet": (team.get("wallet", 0) + amt),
-                        "roster_count": max(0, team.get("roster_count", 1) - 1),
-                    }).eq("id", tid).execute()
-            # Restore auction_state to active with this player
-            if pid:
-                supabase.table("auction_state").update({
-                    "phase": "active",
-                    "current_player_id": pid,
-                    "current_bid": amt,
-                    "current_bid_team": tid,
-                    "is_paused": False,
-                }).eq("id", 1).execute()
-
-        elif action == "player_unsold":
-            # Reverse unsold: put player back to active
-            pid = payload.get("player_id")
-            if pid:
-                player = supabase.table("players").select("base_price")\
-                    .eq("id", pid).single().execute().data
-                supabase.table("players").update({"status": "active"}).eq("id", pid).execute()
-                supabase.table("auction_state").update({
-                    "phase": "active",
-                    "current_player_id": pid,
-                    "current_bid": player.get("base_price", 0) if player else 0,
-                    "current_bid_team": None,
-                    "is_paused": False,
-                }).eq("id", 1).execute()
-
-        elif action == "player_activated":
-            # Reverse pulling a player: set them back to upcoming, clear auction state
-            pid = payload.get("player_id")
-            if pid:
-                supabase.table("players").update({"status": "upcoming"}).eq("id", pid).execute()
-                supabase.table("auction_state").update({
-                    "phase": "idle",
-                    "current_player_id": None,
-                    "current_bid": None,
-                    "current_bid_team": None,
-                    "is_paused": False,
-                }).eq("id", 1).execute()
-
-        elif action == "bid_placed":
-            # Reverse a bid: restore previous bid state from the bids table
-            pid = payload.get("player_id") if payload.get("player_id") else None
-            # Delete the latest bid entry
-            try:
-                bids = supabase.table("bids").select("*")\
-                    .order("created_at", desc=True).limit(2).execute().data or []
-                if bids:
-                    supabase.table("bids").delete().eq("id", bids[0]["id"]).execute()
-                # Restore previous bid if exists
-                if len(bids) > 1:
-                    prev = bids[1]
-                    supabase.table("auction_state").update({
-                        "current_bid": prev["amount"],
-                        "current_bid_team": prev["team_id"],
-                    }).eq("id", 1).execute()
-                else:
-                    # No previous bid — revert to base price
-                    state = supabase.table("auction_state").select("current_player_id")\
-                        .eq("id", 1).single().execute().data
-                    if state and state.get("current_player_id"):
-                        player = supabase.table("players").select("base_price")\
-                            .eq("id", state["current_player_id"]).single().execute().data
-                        supabase.table("auction_state").update({
-                            "current_bid": player.get("base_price", 0) if player else 0,
-                            "current_bid_team": None,
-                        }).eq("id", 1).execute()
-            except Exception:
-                pass  # bids table might not exist
-
-        else:
-            # Unknown action type — just delete the log entry
-            pass
-
-        # Delete the action log entry we just undid
-        supabase.table("action_log").delete().eq("id", last["id"]).execute()
-
-        return {"ok": True, "message": f"Undid: {action}"}
-
-    except Exception as e:
-        return {"ok": False, "error": f"Undo failed: {str(e)}"}
+    res = supabase.rpc("undo_last_action", {}).execute()
+    return res.data
 
 def reset_auction():
     supabase = get_supabase()
@@ -319,21 +200,15 @@ def reset_auction():
         "sold_amount":  None,
     }).neq("class", "Diamond").execute()
 
-    # Reset teams: wallet back to 200000, roster_count to 1 (diamond retained)
+    # Reset teams: wallet back to 300000, roster_count to 1 (diamond retained)
     supabase.table("teams").update({
-        "wallet":       200000,
+        "wallet":       300000,
         "roster_count": 1,
-    }).neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    }).execute()
 
-    # Clear bids + deadlock_bids (tables may not exist — ignore errors)
-    try:
-        supabase.table("bids").delete().gt("amount", 0).execute()
-    except Exception:
-        pass
-    try:
-        supabase.table("deadlock_bids").delete().gt("amount", 0).execute()
-    except Exception:
-        pass
+    # Clear bids + deadlock_bids
+    supabase.table("bids").delete().gt("amount", 0).execute()
+    supabase.table("deadlock_bids").delete().gt("amount", 0).execute()
 
     # Reset auction_state
     supabase.table("auction_state").update({
@@ -355,88 +230,35 @@ def reset_auction():
     return {"ok": True, "message": "Auction reset successfully"}
 
 
-# ── Email notification (uncomment once player email IDs are added) ──────────
-#
-# Required .env variables:
-#   SMTP_HOST=smtp.gmail.com
-#   SMTP_PORT=587
-#   SMTP_USER=your_email@gmail.com
-#   SMTP_PASS=your_app_password
-#   SMTP_FROM=your_email@gmail.com  (optional, defaults to SMTP_USER)
-#
+# def send_whatsapp(to_number: str, message: str) -> bool:
+#     """Send WhatsApp via Twilio. Needs TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM."""
+#     import os
+#     try:
+#         from twilio.rest import Client
+#         client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+#         from_num = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+#         to = f"whatsapp:{to_number}" if not to_number.startswith("whatsapp:") else to_number
+#         client.messages.create(body=message, from_=from_num, to=to)
+#         return True
+#     except Exception as e:
+#         print(f"[WhatsApp] Failed: {e}")
+#         return False
+
+
 # def send_email_notification(to_email: str, subject: str, body: str) -> bool:
-#     """Send email via SMTP."""
+#     """Send email via SMTP. Needs SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS."""
 #     import os, smtplib
 #     from email.mime.text import MIMEText
-#     from email.mime.multipart import MIMEMultipart
 #     try:
-#         msg = MIMEMultipart("alternative")
+#         msg = MIMEText(body)
 #         msg["Subject"] = subject
 #         msg["From"]    = os.environ.get("SMTP_FROM", os.environ["SMTP_USER"])
 #         msg["To"]      = to_email
-#
-#         # Plain text version
-#         msg.attach(MIMEText(body, "plain"))
-#
-#         # HTML version (prettier email)
-#         html = f"""
-#         <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;
-#                     background:#0B0E18;color:#EEF2FF;padding:32px;border-radius:12px;
-#                     border:1px solid rgba(255,215,0,0.15);">
-#             <h1 style="color:#FFD700;font-size:24px;margin-bottom:8px;">
-#                 🏐 Congratulations!
-#             </h1>
-#             <p style="font-size:16px;line-height:1.6;color:#9CA3AF;">
-#                 You have been selected in the <strong style="color:#EEF2FF">TKM Volleyball Auction 2026</strong> 🎉
-#             </p>
-#             <div style="background:#0F1320;padding:16px;border-radius:8px;margin:16px 0;
-#                         border:1px solid rgba(255,255,255,0.07);">
-#                 <p style="margin:0 0 8px;font-size:14px;color:#9CA3AF;">Team</p>
-#                 <p style="margin:0 0 16px;font-size:20px;font-weight:bold;color:#FFD700;">{body.split('Team: ')[1].split(chr(10))[0] if 'Team: ' in body else ''}</p>
-#                 <p style="margin:0 0 8px;font-size:14px;color:#9CA3AF;">Sold Price</p>
-#                 <p style="margin:0;font-size:20px;font-weight:bold;color:#4ADE80;">{body.split('Price: ')[1].split(chr(10))[0] if 'Price: ' in body else ''}</p>
-#             </div>
-#             <p style="font-size:15px;color:#9CA3AF;">All the best for the tournament! 💪</p>
-#         </div>
-#         """
-#         msg.attach(MIMEText(html, "html"))
-#
 #         with smtplib.SMTP(os.environ["SMTP_HOST"], int(os.environ.get("SMTP_PORT", 587))) as s:
 #             s.starttls()
 #             s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
 #             s.send_message(msg)
-#         print(f"[Email] Sent to {to_email}")
 #         return True
 #     except Exception as e:
-#         print(f"[Email] Failed to send to {to_email}: {e}")
+#         print(f"[Email] Failed: {e}")
 #         return False
-#
-#
-# def notify_player_sold(player_id: str, team_name: str, amount: int):
-#     """Send email to a player when they are sold."""
-#     supabase = get_supabase()
-#     player = supabase.table("players").select("name, email")\
-#         .eq("id", player_id).single().execute().data
-#     if not player or not player.get("email"):
-#         print(f"[Notify] No email for player {player_id}, skipping notification")
-#         return
-#
-#     message = (
-#         f"Congratulations {player['name']}!\n\n"
-#         f"You have been selected in the TKM Volleyball Auction 2026.\n\n"
-#         f"Team: {team_name}\n"
-#         f"Price: ₹{amount:,}\n\n"
-#         f"All the best for the tournament!"
-#     )
-#
-#     send_email_notification(
-#         player["email"],
-#         "🏐 You've been selected — TKM Volleyball Auction 2026!",
-#         message,
-#     )
-
-
-# Placeholder so the import in auction.py router doesn't break
-def notify_player_sold(player_id: str, team_name: str, amount: int):
-    """Notification disabled — uncomment the email block above once player emails are available."""
-    pass
