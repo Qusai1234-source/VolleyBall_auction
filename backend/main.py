@@ -17,6 +17,7 @@ app = FastAPI(title="Volleyball Auction API")
 allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://volley-ball-auction.vercel.app"
 ]
 
 # Allow any extra origin set via env var (e.g. FRONTEND_URL=https://your-app.vercel.app)
