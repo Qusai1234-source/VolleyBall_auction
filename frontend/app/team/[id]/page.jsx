@@ -41,7 +41,7 @@ const classCfg = (cls) => CLASS_CFG[normaliseClass(cls)] || CLASS_CFG.other
 
 const GOLD_BASE = 20000
 const SILVER_BASE = 10000
-const STARTING_WALLET = 200000
+const STARTING_WALLET = 300000
 
 // currentCls: class of player on the block; squad: acquired players for this team
 const calcMaxBid = (team, currentCls = null, squad = []) => {

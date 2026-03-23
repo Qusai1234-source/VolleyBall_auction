@@ -50,7 +50,7 @@ const CLASS_CFG = {
 }
 const classCfg = (cls) => CLASS_CFG[normaliseClass(cls)] || CLASS_CFG.other
 
-const GOLD_BASE = 20000, SILVER_BASE = 10000, STARTING_WALLET = 200000
+const GOLD_BASE = 20000, SILVER_BASE = 10000, STARTING_WALLET = 300000
 
 const calcMaxBid = (team, currentCls = null, squad = []) => {
     const goldHave = squad.filter(p => normaliseClass(p.cls) === 'gold').length
@@ -376,6 +376,9 @@ export default function ScoreboardPage() {
         else allTeams.forEach(t => fetchRoster(t.id, true))
     }, [fetchRoster, allTeams])
 
+    const handlePlayerChangeRef = useRef(handlePlayerChange)
+    useEffect(() => { handlePlayerChangeRef.current = handlePlayerChange }, [handlePlayerChange])
+
     useEffect(() => { fetchAll() }, [])
     useEffect(() => { allTeams.forEach(t => fetchRoster(t.id)) }, [allTeams.length])
 
@@ -383,7 +386,7 @@ export default function ScoreboardPage() {
         const ch = supabase.channel('scoreboard')
             .on('postgres_changes', { event: '*', schema: 'public', table: 'auction_state' }, () => debouncedFetchRef.current())
             .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, () => debouncedFetchRef.current())
-            .on('postgres_changes', { event: '*', schema: 'public', table: 'players' }, handlePlayerChange)
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'players' }, (pl) => handlePlayerChangeRef.current(pl))
             .subscribe()
         return () => supabase.removeChannel(ch)
     }, [])
