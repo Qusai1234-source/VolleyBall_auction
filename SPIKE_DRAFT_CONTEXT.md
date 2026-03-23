@@ -58,7 +58,7 @@ const TEAM_BRAND = {
 ```js
 GOLD_BASE       = 20000   // Gold player base price
 SILVER_BASE     = 10000   // Silver player base price
-STARTING_WALLET = 300000  // Per team starting budget (₹3,00,000)
+STARTING_WALLET = 200000  // Per team starting budget (₹3,00,000)
 // Required: 2 Gold + 5 Silver per team (7 auction slots, 1 Diamond retained)
 // Total squad size: 8 (1 diamond + 7 auctioned)
 ```
@@ -402,10 +402,10 @@ Other:                 #C084FC (purple)
 
 | Issue | Fix |
 |-------|-----|
-| Wallet bar stuck at 100% | `STARTING_WALLET` was 200000, DB has 300000 — corrected to 300000 |
+| Wallet bar stuck at 100% | `STARTING_WALLET` was 200000, DB has 200000 — corrected to 200000 |
 | 8th player blocked ("roster is full") | `mark_player_sold` RPC used `>=` instead of `>` — fixed in Supabase SQL editor |
 | Realtime stale closure | `fetchAllRef` + `debouncedFetchRef` pattern on all 3 pages |
-| `max_wallet` always 100% | Hardcoded to 300000 in `auction_service.py` and `teams.py` |
+| `max_wallet` always 100% | Hardcoded to 200000 in `auction_service.py` and `teams.py` |
 | `action_log` wrong columns | Fixed from `action_type`/`description` to `action`/`payload` |
 | Thundering herd on Realtime | 120ms debounce collapses multiple simultaneous events |
 | Badge text not centred | Added `display: inline-flex; alignItems: center; justifyContent: center` |

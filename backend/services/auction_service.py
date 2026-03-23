@@ -31,7 +31,7 @@ def get_auction_state():
     for t in rows:
         t["players_bought"] = t.get("roster_count", 0)
         t["max_players"]    = t.get("max_slots", 0)
-        t["max_wallet"]     = 300000
+        t["max_wallet"]     = 200000
     state["teams"] = rows
 
     # action_log not fetched here - admin fetches separately
@@ -204,11 +204,12 @@ def reset_auction():
     supabase.table("teams").update({
         "wallet":       300000,
         "roster_count": 1,
-    }).execute()
+    }).neq("id", "00000000-0000-0000-0000-000000000000").execute()
 
     # Clear bids + deadlock_bids
-    supabase.table("bids").delete().gt("amount", 0).execute()
-    supabase.table("deadlock_bids").delete().gt("amount", 0).execute()
+    supabase.table("bids").delete().neq("id", -1).execute()
+    supabase.table("deadlock_bids").delete().neq("id", -1).execute()
+
 
     # Reset auction_state
     supabase.table("auction_state").update({

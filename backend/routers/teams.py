@@ -14,7 +14,7 @@ def _alias_team(t: dict) -> dict:
     """Add frontend-expected aliases to a team row."""
     t["players_bought"] = t.get("roster_count", 0)
     t["max_players"]    = t.get("max_slots", 0)
-    t["max_wallet"]     = 200000  # fixed starting budget
+    t["max_wallet"]     = 300000  # fixed starting budget
     return t
 
 

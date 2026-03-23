@@ -41,10 +41,11 @@ const classCfg = (cls) => CLASS_CFG[normaliseClass(cls)] || CLASS_CFG.other
 
 const GOLD_BASE = 20000
 const SILVER_BASE = 10000
-const STARTING_WALLET = 300000
+const STARTING_WALLET = 200000
 
 // currentCls: class of player on the block; squad: acquired players for this team
 const calcMaxBid = (team, currentCls = null, squad = []) => {
+    if (!team) return 0
     const goldHave = squad.filter(p => normaliseClass(p.cls) === 'gold').length
     const silverHave = squad.filter(p => normaliseClass(p.cls) === 'silver').length
     let goldNeed = Math.max(0, 2 - goldHave)
@@ -356,11 +357,24 @@ export default function TeamRosterPage() {
                 fetch(`${API}/teams/${teamId}/watchlist`),
                 fetch(`${API}/players/`),
             ])
-            if (sr.ok) { const d = await sr.json(); setAstate(d); setAllTeams(d.teams || []); const t = (d.teams || []).find(x => String(x.id) === String(teamId)); if (t) setMyTeam(t) }
+            if (sr.ok) {
+                const d = await sr.json();
+                setAstate(d);
+                const teams = d.teams || [];
+                setAllTeams(teams);
+                const t = teams.find(x => String(x.id).toLowerCase() === String(teamId).toLowerCase());
+                if (t) setMyTeam(t);
+                else console.warn(`Team Dashboard: Could not find team with ID ${teamId} in teams list`, teams);
+            }
             if (rr.ok) setSquad(await rr.json())
             if (wlr.ok) setWatchlist(await wlr.json())
-            if (pr.ok) { const all = await pr.json(); setAvPlayers(all.filter(p => p.status === 'upcoming' || p.status === 'unsold')) }
-        } catch { }
+            if (pr.ok) {
+                const all = await pr.json();
+                setAvPlayers(all.filter(p => p.status === 'upcoming' || p.status === 'unsold'))
+            }
+        } catch (err) {
+            console.error("Team Dashboard fetch error:", err);
+        }
     }, [teamId])
 
     useEffect(() => { fetchAll().finally(() => setLoading(false)) }, [])
