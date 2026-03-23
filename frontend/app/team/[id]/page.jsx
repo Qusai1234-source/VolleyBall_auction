@@ -364,11 +364,6 @@ export default function TeamRosterPage() {
     }, [teamId])
 
     useEffect(() => { fetchAll().finally(() => setLoading(false)) }, [])
-    // polling fallback — catches anything realtime misses
-    useEffect(() => {
-        const interval = setInterval(() => fetchAllRef.current(), 5000)
-        return () => clearInterval(interval)
-    }, [])
     // always keep ref pointing to latest fetchAll so realtime never calls a stale closure
     const fetchAllRef = useRef(fetchAll)
     useEffect(() => { fetchAllRef.current = fetchAll }, [fetchAll])
