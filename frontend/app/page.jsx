@@ -368,21 +368,12 @@ export default function ScoreboardPage() {
     const playUnsold = useCallback(() => {
         try {
             if (!unsoldAudioRef.current) {
-                const audio = new Audio('/sounds/unsold.mp3')
-                audio.volume = 0.75
-                audio.preload = 'auto'
-                unsoldAudioRef.current = audio
+                unsoldAudioRef.current = new Audio('/sounds/unsold.mp3')
+                unsoldAudioRef.current.volume = 0.75
             }
             unsoldAudioRef.current.currentTime = 0
-            const playPromise = unsoldAudioRef.current.play()
-            if (playPromise !== undefined) {
-                playPromise.catch(err => {
-                    console.warn("[Audio] Unsold sound failed to play:", err)
-                })
-            }
-        } catch (e) {
-            console.error("[Audio] Unsold sound error:", e)
-        }
+            unsoldAudioRef.current.play().catch(() => { })
+        } catch (e) { }
     }, [])
 
     const triggerSoldAnim = useCallback((playerRow, teamRow) => {
@@ -766,7 +757,7 @@ export default function ScoreboardPage() {
 
         /* idle */
         .idle-zone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:40px;text-align:center}
-        .idle-img{opacity:0.17}
+        .idle-img{opacity:0.18}
         .idle-title{font-family:var(--fd);font-size:clamp(3rem,5vw,5.5rem);letter-spacing:4px;color:var(--muted);white-space:pre-line;line-height:1}
         .idle-sub{font-family:var(--fu);font-size:0.8rem;font-weight:700;letter-spacing:4px;color:var(--muted);text-transform:uppercase}
 
@@ -1040,7 +1031,7 @@ export default function ScoreboardPage() {
                             </div>
                         ) : (
                             <div className="idle-zone">
-                                <img src="/images/court-graphic.png" alt="" width="200" height="200" className="idle-img" onError={e => e.target.style.display = 'none'} />
+                                <img src="/images/court-graphic.png" alt="" width="130" className="idle-img" onError={e => e.target.style.display = 'none'} />
                                 <div className="idle-title">{isPaused ? 'AUCTION\nPAUSED' : 'STANDING\nBY'}</div>
                                 <div className="idle-sub">{isPaused ? 'Auctioneer will resume shortly' : 'Next player coming up'}</div>
                             </div>

@@ -364,24 +364,15 @@ export default function TeamRosterPage() {
         } catch (e) { }
     }, [])
 
-    const playUnsold = useCallback(() => {
+    const playUnsound = useCallback(() => {
         try {
             if (!unsoldAudioRef.current) {
-                const audio = new Audio('/sounds/unsold.mp3')
-                audio.volume = 0.75
-                audio.preload = 'auto'
-                unsoldAudioRef.current = audio
+                unsoldAudioRef.current = new Audio('/sounds/unsold.mp3')
+                unsoldAudioRef.current.volume = 0.75
             }
             unsoldAudioRef.current.currentTime = 0
-            const playPromise = unsoldAudioRef.current.play()
-            if (playPromise !== undefined) {
-                playPromise.catch(err => {
-                    console.warn("[Audio] Unsold sound failed to play:", err)
-                })
-            }
-        } catch (e) {
-            console.error("[Audio] Unsold sound error:", e)
-        }
+            unsoldAudioRef.current.play().catch(() => { })
+        } catch (e) { }
     }, [])
 
     const triggerSoldAnim = useCallback((playerRow, teamRow) => {
@@ -399,12 +390,12 @@ export default function TeamRosterPage() {
         clearTimeout(unsoldAnimRef.current)
         clearTimeout(unsoldLeaveRef.current)
         setUnsoldAnim({ player: playerRow, leaving: false })
-        playUnsold()
+        playUnsound()
         unsoldAnimRef.current = setTimeout(() => {
             setUnsoldAnim(prev => prev ? { ...prev, leaving: true } : null)
             unsoldLeaveRef.current = setTimeout(() => setUnsoldAnim(null), 400)
         }, 3500)
-    }, [playUnsold])
+    }, [playUnsound])
 
     const showToast = (msg, type = 'info') => {
         setToast({ msg, type })

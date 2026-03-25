@@ -125,12 +125,21 @@ export default function AdminDashboard() {
     const resetInputRef = useRef(null)
 
     // keyboard bid flash feedback
-    const [kbFlash, setKbFlash] = useState(null)   // { teamId, key }
-    const [kbBlocked, setKbBlocked] = useState(null) // { teamId } — wallet-exceeded
-    const kbBlockedRef = useRef(null)
+    const [kbFlash, setKbFlash] = useState(null) // { teamId, key }
     const kbFlashRef = useRef(null)
-    const kbBusyRef = useRef(false)
+    const [kbBlocked, setKbBlocked] = useState(null) // { teamId } — quota/wallet block
+    const kbBlockedRef = useRef(null)
+    const kbBusyRef = useRef(false) // debounce rapid keypresses
     const isActiveRef = useRef(false) // ref so keydown handler always sees current value
+
+    // Refs so Enter/Space/1-5 handlers always see current values without stale closures
+    const bidAmountRef = useRef('')
+    const winTeamIdRef = useRef('')
+    const astateRef = useRef(null)
+    const allTeamsRef = useRef([])
+    const allPlayersRef = useRef([])
+    const bidWarningRef = useRef(null)
+    const doActionRef = useRef(null)
     const [searchQuery, setSearchQuery] = useState('')
     const [searchPreview, setSearchPreview] = useState(null) // player object being previewed
     const searchInputRef = useRef(null)
@@ -205,6 +214,18 @@ export default function AdminDashboard() {
     // ── realtime ───────────────────────────────────────────────────────────
     useEffect(() => {
         const ch = supabase.channel('admin-realtime')
+            // broadcast: instant bid updates from keyboard handler
+            .on('broadcast', { event: 'bid' }, ({ payload }) => {
+                setAstate(prev => prev ? {
+                    ...prev,
+                    current_bid: payload.current_bid,
+                    current_bid_team: payload.current_bid_team,
+                    current_bid_team_id: payload.current_bid_team_id,
+                } : prev)
+                setBidAmount(String(payload.current_bid))
+                setWinTeamId(payload.current_bid_team_id)
+            })
+            // postgres_changes: fallback sync for non-bid state changes
             .on('postgres_changes', { event: '*', schema: 'public', table: 'auction_state' },
                 () => fastRefreshAuction())
             .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' },
@@ -230,6 +251,7 @@ export default function AdminDashboard() {
         } catch { showToast('Network error', 'error') }
         finally { setBusy(b => ({ ...b, [key]: false })) }
     }
+    doActionRef.current = doAction
 
     const pullPlayer = () => {
         if (searchPreview) {
@@ -239,6 +261,56 @@ export default function AdminDashboard() {
         }
     }
 
+    // ── Broadcast channel ref ─────────────────────────────────────────────
+    const broadcastChannelRef = useRef(null)
+
+    useEffect(() => {
+        const ch = supabase.channel('bid-broadcast', { config: { broadcast: { self: false } } })
+        ch.subscribe()
+        broadcastChannelRef.current = ch
+        return () => { supabase.removeChannel(ch) }
+    }, [])
+
+    // Send bid state to all clients instantly via WebSocket broadcast
+    const broadcastBid = useCallback((teamId, amount) => {
+        broadcastChannelRef.current?.send({
+            type: 'broadcast',
+            event: 'bid',
+            payload: {
+                current_bid: amount,
+                current_bid_team: teamId,
+                current_bid_team_id: teamId,
+                current_player_id: astate?.current_player_id,
+                phase: 'active',
+            }
+        })
+    }, [astate?.current_player_id])
+
+    // Write to DB — direct Supabase client (no FastAPI round trip)
+    const persistBid = useCallback(async (teamId, amount) => {
+        try {
+            const { error } = await supabase.from('auction_state').update({
+                current_bid: amount,
+                current_bid_team: teamId,
+            }).eq('id', 1)
+            if (error) throw error
+            // also log to bids table (best-effort)
+            await supabase.from('bids').insert({
+                player_id: astate?.current_player_id,
+                team_id: teamId,
+                amount,
+            }).then(() => { }).catch(() => { })
+        } catch (err) {
+            console.error('[persistBid] Supabase write failed, falling back to FastAPI:', err)
+            // Fallback: FastAPI handles validation + write
+            await fetch(`${API}/auction/assign-opening-bid`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ team_id: teamId, amount }),
+            }).catch(() => { })
+        }
+    }, [astate?.current_player_id])
+
     // ── Keyboard bid increment ─────────────────────────────────────────────
     const getKbIncrement = useCallback((cls, currentBid) => {
         const c = normaliseClass(cls)
@@ -247,31 +319,110 @@ export default function AdminDashboard() {
         return 1000 // diamond / other: safe fallback
     }, [])
 
+    // Fixed increment map for keys 1-5
+    const FIXED_INC_MAP = { '1': 1000, '2': 2000, '3': 3000, '4': 4000, '5': 5000 }
+
     useEffect(() => {
         const handler = async (e) => {
-            // only fire when auction is active
             if (!isActiveRef.current) return
+
+            // Never steal keypresses when the search input is focused
+            if (document.activeElement === searchInputRef.current) return
+
             const key = e.key.toLowerCase()
+            const rawKey = e.key // preserve case for digit detection
+
+            // ── Enter → Confirm Sold ───────────────────────────────────────
+            if (e.key === 'Enter') {
+                e.preventDefault()
+                const tid = winTeamIdRef.current
+                const amt = parseInt(bidAmountRef.current)
+                if (!tid || !amt) { showToast('Select team and enter bid amount first', 'error'); return }
+                // Re-read astate from ref to avoid stale closure
+                const snap = astateRef.current
+                doActionRef.current('sold', '/auction/sold', {
+                    player_id: snap?.current_player_id,
+                    team_id: tid,
+                    amount: amt,
+                })
+                return
+            }
+
+            // ── Space → Update Bid ─────────────────────────────────────────
+            if (e.key === ' ') {
+                e.preventDefault()
+                const tid = winTeamIdRef.current
+                const amt = parseInt(bidAmountRef.current)
+                if (!tid) { showToast('Select a team first', 'error'); return }
+                if (!amt || isNaN(amt)) { showToast('Enter a valid bid amount', 'error'); return }
+                if (bidWarningRef.current) { showToast(bidWarningRef.current, 'error'); return }
+                doActionRef.current('updatebid', '/auction/assign-opening-bid', {
+                    team_id: tid, amount: amt,
+                })
+                return
+            }
+
+            // ── 1-5 → Fixed increment on selected team ─────────────────────
+            const fixedInc = FIXED_INC_MAP[rawKey]
+            if (fixedInc) {
+                e.preventDefault()
+                const tid = winTeamIdRef.current
+                if (!tid) { showToast('Select a team first to use increment keys', 'error'); return }
+                if (kbBusyRef.current) return
+                kbBusyRef.current = true
+
+                const snap = astateRef.current
+                const teams = allTeamsRef.current
+                const players = allPlayersRef.current
+                const team = teams.find(t => t.id === tid)
+                if (!team) { kbBusyRef.current = false; return }
+
+                const currentBid = snap?.current_bid || snap?.current_player?.base_price || 0
+                const cls = snap?.current_player?.cls
+                const newBid = currentBid + fixedInc
+
+                // All block checks
+                const tSquad = players.filter(p => p.status === 'sold' && p.sold_to_team === team.id)
+                const fireBlocked = (reason) => {
+                    setKbBlocked({ teamId: team.id })
+                    clearTimeout(kbBlockedRef.current)
+                    kbBlockedRef.current = setTimeout(() => setKbBlocked(null), 600)
+                    showToast(`${team.name} — ${reason}`, 'error')
+                    kbBusyRef.current = false
+                }
+                const MAX_SQUAD = team.max_players ?? 8
+                if ((team.players_bought ?? 0) >= MAX_SQUAD) { fireBlocked('squad full (8/8)'); return }
+                const currentClass = normaliseClass(cls)
+                if (currentClass === 'gold' && tSquad.filter(p => normaliseClass(p.cls) === 'gold').length >= 2) { fireBlocked('gold quota full (2/2)'); return }
+                if (currentClass === 'silver' && tSquad.filter(p => normaliseClass(p.cls) === 'silver').length >= 5) { fireBlocked('silver quota full (5/5)'); return }
+                const maxSafe = calcMaxBid(team, currentClass, tSquad)
+                if (newBid > maxSafe) { fireBlocked(`max bid reached (${fmtFull(maxSafe)})`); return }
+
+                // Only update local bid input — admin presses Space to commit
+                setBidAmount(String(newBid))
+                kbBusyRef.current = false
+                return
+            }
+
+            // ── Team letter keys → bid increment for that team ─────────────
             const teamNameFragment = TEAM_KEY_MAP[key]
             if (!teamNameFragment) return
 
-            // find matching team (case-insensitive name match)
-            const team = allTeams.find(t => t.name.toLowerCase() === teamNameFragment)
+            const team = allTeamsRef.current.find(t => t.name.toLowerCase() === teamNameFragment)
             if (!team) return
 
-            // debounce: ignore if a kb bid is already in flight
             if (kbBusyRef.current) return
             kbBusyRef.current = true
 
-            const currentBid = astate?.current_bid || astate?.current_player?.base_price || 0
-            const cls = astate?.current_player?.cls
+            const snap = astateRef.current
+            const players = allPlayersRef.current
+            const currentBid = snap?.current_bid || snap?.current_player?.base_price || 0
+            const cls = snap?.current_player?.cls
             const inc = getKbIncrement(cls, currentBid)
             const newBid = currentBid + inc
 
-            // wallet / max-bid guard — also fires red flash on the button
-            const tSquad = allPlayers.filter(p => p.status === 'sold' && p.sold_to_team === team.id)
-            let maxAllowed = calcMaxBid(team, normaliseClass(cls), tSquad)
-
+            // All block checks
+            const tSquad = players.filter(p => p.status === 'sold' && p.sold_to_team === team.id)
             const fireBlocked = (reason) => {
                 setKbBlocked({ teamId: team.id })
                 clearTimeout(kbBlockedRef.current)
@@ -279,67 +430,27 @@ export default function AdminDashboard() {
                 showToast(`${team.name} — ${reason}`, 'error')
                 kbBusyRef.current = false
             }
-
-            // 1. Max player quota (8 players)
             const MAX_SQUAD = team.max_players ?? 8
-            if ((team.players_bought ?? 0) >= MAX_SQUAD) {
-                fireBlocked('squad full (8/8)')
-                return
-            }
+            if ((team.players_bought ?? 0) >= MAX_SQUAD) { fireBlocked('squad full (8/8)'); return }
+            const currentClass = normaliseClass(cls)
+            if (currentClass === 'gold' && tSquad.filter(p => normaliseClass(p.cls) === 'gold').length >= 2) { fireBlocked('gold quota full (2/2)'); return }
+            if (currentClass === 'silver' && tSquad.filter(p => normaliseClass(p.cls) === 'silver').length >= 5) { fireBlocked('silver quota full (5/5)'); return }
+            const maxSafe = calcMaxBid(team, currentClass, tSquad)
+            if (newBid > maxSafe) { fireBlocked(`max bid reached (${fmtFull(maxSafe)})`); return }
 
-            // 2. Gold class quota (max 2)
-            if (normaliseClass(cls) === 'gold') {
-                const goldHave = tSquad.filter(p => normaliseClass(p.cls) === 'gold').length
-                if (goldHave >= 2) {
-                    fireBlocked('gold quota full (2/2)')
-                    return
-                }
-            }
-
-            // 3. Silver class quota (max 5)
-            if (normaliseClass(cls) === 'silver') {
-                const silverHave = tSquad.filter(p => normaliseClass(p.cls) === 'silver').length
-                if (silverHave >= 5) {
-                    fireBlocked('silver quota full (5/5)')
-                    return
-                }
-            }
-
-            // 4. Max bid / wallet guard
-            maxAllowed = calcMaxBid(team, normaliseClass(cls), tSquad)
-            if (newBid > maxAllowed) {
-                fireBlocked('max bid reached')
-                return
-            }
-
-            // flash feedback
+            // Flash + update
             setKbFlash({ teamId: team.id, key: key.toUpperCase() })
             clearTimeout(kbFlashRef.current)
             kbFlashRef.current = setTimeout(() => setKbFlash(null), 600)
-
-            // update local state immediately for snappy UI
             setBidAmount(String(newBid))
             setWinTeamId(team.id)
-
-            // fire API
-            try {
-                const r = await fetch(`${API}/auction/assign-opening-bid`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ team_id: team.id, amount: newBid }),
-                })
-                const d = await r.json()
-                if (!r.ok) showToast(d.detail || 'Bid failed', 'error')
-            } catch {
-                showToast('Network error', 'error')
-            } finally {
-                kbBusyRef.current = false
-            }
+            broadcastBid(team.id, newBid)
+            persistBid(team.id, newBid).finally(() => { kbBusyRef.current = false })
         }
 
         window.addEventListener('keydown', handler)
         return () => window.removeEventListener('keydown', handler)
-    }, [astate, allTeams, getKbIncrement, showToast])
+    }, [showToast, getKbIncrement, broadcastBid, persistBid])
     const markUnsold = () => doAction('unsold', '/auction/unsold')
 
     // ── Undo: fetch preview first, show confirm, then fire ─────────────────
@@ -441,6 +552,13 @@ export default function AdminDashboard() {
     const currentPlayer = astate?.current_player
     const leadingTeam = allTeams.find(t => t.id === astate?.current_bid_team_id)
 
+    // Keep refs in sync so keyboard handlers never read stale state
+    astateRef.current = astate
+    allTeamsRef.current = allTeams
+    allPlayersRef.current = allPlayers
+    bidAmountRef.current = bidAmount
+    winTeamIdRef.current = winTeamId
+
     const poolPlayers = allPlayers.filter(p =>
         poolFilter === 'available' ? p.status === 'upcoming'
             : poolFilter === 'unsold' ? p.status === 'unsold'
@@ -481,6 +599,7 @@ export default function AdminDashboard() {
         if (bidAmt > calcMaxBid(t, currentClass, tSq)) return `Exceeds ${t.name}'s max safe bid (${fmtFull(calcMaxBid(t, currentClass, tSq))}) — not enough left`
         return null
     })()
+    bidWarningRef.current = bidWarning
 
     if (loading) return (
         <div style={{ minHeight: '100vh', background: '#060810', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 14 }}>
@@ -560,25 +679,18 @@ export default function AdminDashboard() {
         .pool-item.preview .pi-name{color:var(--acc)}
 
         /* keyboard flash */
-@keyframes kbFlash {
-  0%  { box-shadow: 0 0 0 0 rgba(255,215,0,0.7); border-color: rgba(255,215,0,0.9); background: rgba(255,215,0,0.18) }
-  60% { box-shadow: 0 0 0 8px rgba(255,215,0,0); }
-  100%{ box-shadow: 0 0 0 0 rgba(255,215,0,0); }
-}
-.kb-flash { animation: kbFlash 0.55s ease-out forwards !important; }
-@keyframes kbBlocked {
-  0%  { box-shadow: 0 0 0 0 rgba(248,113,113,0.8); border-color: rgba(248,113,113,0.9); background: rgba(248,113,113,0.18) }
-  60% { box-shadow: 0 0 0 8px rgba(248,113,113,0); }
-  100%{ box-shadow: 0 0 0 0 rgba(248,113,113,0); }
-}
-.kb-blocked { animation: kbBlocked 0.55s ease-out forwards !important; }
-@keyframes kbBlocked {
-  0%  { box-shadow: 0 0 0 0 rgba(248,113,113,0.8); border-color: rgba(248,113,113,0.9); background: rgba(248,113,113,0.18) }
-  60% { box-shadow: 0 0 0 8px rgba(248,113,113,0); }
-  100%{ box-shadow: 0 0 0 0 rgba(248,113,113,0); }
-}
-.kb-blocked { animation: kbBlocked 0.55s ease-out forwards !important; }
+        @keyframes kbFlash {
+          0%  { box-shadow: 0 0 0 0 rgba(255,215,0,0.7); border-color: rgba(255,215,0,0.9); background: rgba(255,215,0,0.18) }
+          60% { box-shadow: 0 0 0 8px rgba(255,215,0,0); }
+          100%{ box-shadow: 0 0 0 0 rgba(255,215,0,0); }
+        }
         .kb-flash { animation: kbFlash 0.55s ease-out forwards !important; }
+        @keyframes kbBlocked {
+          0%  { box-shadow: 0 0 0 0 rgba(248,113,113,0.8); border-color: rgba(248,113,113,0.9); background: rgba(248,113,113,0.18) }
+          60% { box-shadow: 0 0 0 8px rgba(248,113,113,0); }
+          100%{ box-shadow: 0 0 0 0 rgba(248,113,113,0); }
+        }
+        .kb-blocked { animation: kbBlocked 0.55s ease-out forwards !important; }
         .kb-key{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid rgba(255,215,0,0.3);background:rgba(255,215,0,0.06);font-family:var(--mono);font-size:0.58rem;color:var(--acc);border-radius:2px;flex-shrink:0}
 
         /* hotkey legend bar */
@@ -790,6 +902,22 @@ export default function AdminDashboard() {
                                     </div>
                                 )
                             })}
+                            <div style={{ width: 1, height: 14, background: 'var(--border2)', margin: '0 2px' }} />
+                            {[1, 2, 3, 4, 5].map(n => (
+                                <div key={n} className="kb-legend-item">
+                                    <span className="kb-key">{n}</span>
+                                    <span>+{n}K</span>
+                                </div>
+                            ))}
+                            <div style={{ width: 1, height: 14, background: 'var(--border2)', margin: '0 2px' }} />
+                            <div className="kb-legend-item">
+                                <span className="kb-key" style={{ width: 'auto', padding: '0 5px', borderColor: 'rgba(251,146,60,0.35)', background: 'rgba(251,146,60,0.06)', color: 'var(--orange)' }}>SPC</span>
+                                <span>Update Bid</span>
+                            </div>
+                            <div className="kb-legend-item">
+                                <span className="kb-key" style={{ width: 'auto', padding: '0 5px', borderColor: 'rgba(74,222,128,0.35)', background: 'rgba(74,222,128,0.06)', color: 'var(--green)' }}>ENT</span>
+                                <span>Confirm Sold</span>
+                            </div>
                         </div>
                     </div>
 
@@ -879,7 +1007,6 @@ export default function AdminDashboard() {
                                             placeholder="Enter amount"
                                             value={bidAmount}
                                             onChange={e => setBidAmount(e.target.value)}
-                                            onKeyDown={e => e.key === 'Enter' && updateBid()}
                                             min={0}
                                         />
                                     </div>
@@ -950,11 +1077,6 @@ export default function AdminDashboard() {
                                                     {isTeamClassLocked(t.id) && (
                                                         <div style={{ fontFamily: 'var(--fu)', fontSize: '0.52rem', letterSpacing: '2px', color: 'var(--red)', textTransform: 'uppercase' }}>
                                                             {currentClass} quota full
-                                                        </div>
-                                                    )}
-                                                    {!isTeamClassLocked(t.id) && (t.players_bought ?? 0) >= (t.max_players ?? 8) && (
-                                                        <div style={{ fontFamily: 'var(--fu)', fontSize: '0.52rem', letterSpacing: '2px', color: 'var(--red)', textTransform: 'uppercase' }}>
-                                                            squad full
                                                         </div>
                                                     )}
                                                     {/* wallet + max bid */}
