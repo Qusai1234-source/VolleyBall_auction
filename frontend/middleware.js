@@ -24,18 +24,18 @@ export async function middleware(request) {
         }
     )
 
-    const { data: { session } } = await supabase.auth.getSession()
+    const { data: { user } } = await supabase.auth.getUser()
 
     // If trying to access /admin without a session — redirect to login
     if (request.nextUrl.pathname.startsWith('/admin') &&
         !request.nextUrl.pathname.startsWith('/admin/login')) {
-        if (!session) {
+        if (!user) {
             return NextResponse.redirect(new URL('/admin/login', request.url))
         }
     }
 
     // If already logged in and hitting /admin/login — redirect to dashboard
-    if (request.nextUrl.pathname === '/admin/login' && session) {
+    if (request.nextUrl.pathname === '/admin/login' && user) {
         return NextResponse.redirect(new URL('/admin', request.url))
     }
 

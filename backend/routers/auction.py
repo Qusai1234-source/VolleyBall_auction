@@ -2,6 +2,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from services import auction_service
 from services.supabase_client import get_supabase
+from services.email_service import send_sold_notification
+import threading
 
 router = APIRouter(prefix="/auction", tags=["auction"])
 
@@ -99,14 +101,26 @@ def mark_sold(body: SoldRequest):
     }).execute()
     if not res.data["ok"]:
         raise HTTPException(400, res.data["error"])
-    # async-safe: fire and forget notification
+
+    # fire email in background thread — never blocks the sale response
     try:
-        state  = auction_service.get_auction_state()
-        team   = next((t for t in state.get("teams", []) if t["id"] == body.team_id), None)
-        if team:
-            auction_service.notify_player_sold(body.player_id, team["name"], body.amount)
-    except Exception:
-        pass  # never block the sale response
+        player = supabase.table("players").select("*").eq("id", body.player_id).single().execute().data
+        team   = supabase.table("teams").select("*").eq("id", body.team_id).single().execute().data
+        if player and team:
+            def _send():
+                send_sold_notification(
+                    player_id       = player.get("id", "Unknown"),
+                    player_name     = player.get("name", "Unknown"),
+                    player_position = player.get("position"),
+                    player_class    = player.get("class"),
+                    team_name       = team.get("name", "Unknown"),
+                    sold_amount     = body.amount,
+                    base_price      = player.get("base_price"),
+                )
+            threading.Thread(target=_send, daemon=True).start()
+    except Exception as e:
+        print(f"[Email] Could not queue notification: {e}")  # log but never raise
+
     return res.data
 
 

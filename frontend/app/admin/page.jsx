@@ -18,6 +18,16 @@ const POS_COLOR = {
 }
 const posStyle = (pos) => POS_COLOR[pos?.toLowerCase()] || { bg: 'rgba(255,215,0,0.1)', border: 'rgba(255,215,0,0.3)', text: '#FCD34D' }
 
+// ── Keyboard → Team mapping ───────────────────────────────────────────────
+const TEAM_KEY_MAP = {
+    'l': 'ace lions',
+    'd': 'agile dolphins',
+    'p': 'ferocious panthers',
+    'b': 'powerhouse bulls',
+    's': 'spikey pirhanas',
+    'h': 'block hawks',
+}
+
 const normaliseClass = (cls) => {
     if (!cls) return 'other'
     const c = cls.toLowerCase()
@@ -89,9 +99,10 @@ function SL({ children }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+const supabase = createClient()
+
 export default function AdminDashboard() {
     const router = useRouter()
-    const supabase = createClient()
 
     const [astate, setAstate] = useState(null)
     const [allTeams, setAllTeams] = useState([])
@@ -108,6 +119,21 @@ export default function AdminDashboard() {
     const [toast, setToast] = useState(null)
     const toastRef = useRef(null)
     const [showResetConfirm, setShowResetConfirm] = useState(false)
+    const [resetPreview, setResetPreview] = useState(null)   // data from /auction/reset-preview
+    const [undoPreview, setUndoPreview] = useState(null)     // data from /auction/undo-preview
+    const [showUndoConfirm, setShowUndoConfirm] = useState(false)
+    const resetInputRef = useRef(null)
+
+    // keyboard bid flash feedback
+    const [kbFlash, setKbFlash] = useState(null)   // { teamId, key }
+    const [kbBlocked, setKbBlocked] = useState(null) // { teamId } — wallet-exceeded
+    const kbBlockedRef = useRef(null)
+    const kbFlashRef = useRef(null)
+    const kbBusyRef = useRef(false)
+    const isActiveRef = useRef(false) // ref so keydown handler always sees current value
+    const [searchQuery, setSearchQuery] = useState('')
+    const [searchPreview, setSearchPreview] = useState(null) // player object being previewed
+    const searchInputRef = useRef(null)
 
     const showToast = useCallback((msg, type = 'info') => {
         setToast({ msg, type })
@@ -133,25 +159,62 @@ export default function AdminDashboard() {
     useEffect(() => {
         if (astate?.current_player) {
             setBidAmount(String(astate.current_bid || astate.current_player.base_price || ''))
+            // clear search state once a player is on the block
+            setSearchPreview(null)
+            setSearchQuery('')
         } else {
             setBidAmount('')
         }
         setWinTeamId('')
     }, [astate?.current_player_id])
 
-    // ── realtime ───────────────────────────────────────────────────────────
-    const fetchAllRef = useRef(fetchAll)
-    useEffect(() => { fetchAllRef.current = fetchAll }, [fetchAll])
+    // ── Fast direct Supabase reads for realtime callbacks ────────────────
+    const fastRefreshAuction = useCallback(async () => {
+        try {
+            const { data: stateRow } = await supabase
+                .from('auction_state').select('*').eq('id', 1).single()
+            if (!stateRow) return
+            let currentPlayer = null
+            if (stateRow.current_player_id) {
+                const { data: p } = await supabase
+                    .from('players').select('*').eq('id', stateRow.current_player_id).single()
+                if (p) { p.cls = p.class; p.sold_price = p.sold_amount; currentPlayer = p }
+            }
+            const { data: teamsRaw } = await supabase.from('teams').select('*').order('name')
+            const teams = (teamsRaw || []).map(t => ({
+                ...t, players_bought: t.roster_count ?? 0,
+                max_players: t.max_slots ?? 0, max_wallet: 200000,
+            }))
+            let phase = stateRow.phase
+            if (stateRow.is_paused && phase === 'active') phase = 'paused'
+            setAstate({
+                ...stateRow, phase, current_player: currentPlayer,
+                current_bid_team_id: stateRow.current_bid_team, teams, action_log: []
+            })
+            setAllTeams(teams)
+        } catch (err) { console.error('Admin fast refresh error:', err) }
+    }, [])
 
+    const fastRefreshPlayers = useCallback(async () => {
+        try {
+            const { data } = await supabase.from('players').select('*')
+            setAllPlayers((data || []).map(p => ({ ...p, cls: p.class, sold_price: p.sold_amount })))
+        } catch (err) { console.error('Admin fast players refresh error:', err) }
+    }, [])
+
+    // ── realtime ───────────────────────────────────────────────────────────
     useEffect(() => {
         const ch = supabase.channel('admin-realtime')
-            .on('postgres_changes', { event: '*', schema: 'public', table: 'auction_state' }, () => fetchAllRef.current())
-            .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, () => fetchAllRef.current())
-            .on('postgres_changes', { event: '*', schema: 'public', table: 'players' }, () => fetchAllRef.current())
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'auction_state' },
+                () => fastRefreshAuction())
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' },
+                () => fastRefreshAuction())
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'players' },
+                () => { fastRefreshAuction(); fastRefreshPlayers() })
             .on('system', {}, p => setConnected(p.status === 'SUBSCRIBED'))
             .subscribe(s => setConnected(s === 'SUBSCRIBED'))
         return () => supabase.removeChannel(ch)
-    }, [])
+    }, [fastRefreshAuction, fastRefreshPlayers])
 
     // ── actions ────────────────────────────────────────────────────────────
     const doAction = async (key, path, body = {}) => {
@@ -168,11 +231,166 @@ export default function AdminDashboard() {
         finally { setBusy(b => ({ ...b, [key]: false })) }
     }
 
-    const pullPlayer = () => doAction('pull', '/auction/pull-player')
+    const pullPlayer = () => {
+        if (searchPreview) {
+            doAction('pull', '/auction/pull-player', { override_player_id: searchPreview.id })
+        } else {
+            doAction('pull', '/auction/pull-player')
+        }
+    }
+
+    // ── Keyboard bid increment ─────────────────────────────────────────────
+    const getKbIncrement = useCallback((cls, currentBid) => {
+        const c = normaliseClass(cls)
+        if (c === 'gold') return currentBid < 50000 ? 2000 : 5000
+        if (c === 'silver') return currentBid < 30000 ? 1000 : 2000
+        return 1000 // diamond / other: safe fallback
+    }, [])
+
+    useEffect(() => {
+        const handler = async (e) => {
+            // only fire when auction is active
+            if (!isActiveRef.current) return
+            const key = e.key.toLowerCase()
+            const teamNameFragment = TEAM_KEY_MAP[key]
+            if (!teamNameFragment) return
+
+            // find matching team (case-insensitive name match)
+            const team = allTeams.find(t => t.name.toLowerCase() === teamNameFragment)
+            if (!team) return
+
+            // debounce: ignore if a kb bid is already in flight
+            if (kbBusyRef.current) return
+            kbBusyRef.current = true
+
+            const currentBid = astate?.current_bid || astate?.current_player?.base_price || 0
+            const cls = astate?.current_player?.cls
+            const inc = getKbIncrement(cls, currentBid)
+            const newBid = currentBid + inc
+
+            // wallet / max-bid guard — also fires red flash on the button
+            const tSquad = allPlayers.filter(p => p.status === 'sold' && p.sold_to_team === team.id)
+            let maxAllowed = calcMaxBid(team, normaliseClass(cls), tSquad)
+
+            const fireBlocked = (reason) => {
+                setKbBlocked({ teamId: team.id })
+                clearTimeout(kbBlockedRef.current)
+                kbBlockedRef.current = setTimeout(() => setKbBlocked(null), 600)
+                showToast(`${team.name} — ${reason}`, 'error')
+                kbBusyRef.current = false
+            }
+
+            // 1. Max player quota (8 players)
+            const MAX_SQUAD = team.max_players ?? 8
+            if ((team.players_bought ?? 0) >= MAX_SQUAD) {
+                fireBlocked('squad full (8/8)')
+                return
+            }
+
+            // 2. Gold class quota (max 2)
+            if (normaliseClass(cls) === 'gold') {
+                const goldHave = tSquad.filter(p => normaliseClass(p.cls) === 'gold').length
+                if (goldHave >= 2) {
+                    fireBlocked('gold quota full (2/2)')
+                    return
+                }
+            }
+
+            // 3. Silver class quota (max 5)
+            if (normaliseClass(cls) === 'silver') {
+                const silverHave = tSquad.filter(p => normaliseClass(p.cls) === 'silver').length
+                if (silverHave >= 5) {
+                    fireBlocked('silver quota full (5/5)')
+                    return
+                }
+            }
+
+            // 4. Max bid / wallet guard
+            maxAllowed = calcMaxBid(team, normaliseClass(cls), tSquad)
+            if (newBid > maxAllowed) {
+                fireBlocked('max bid reached')
+                return
+            }
+
+            // flash feedback
+            setKbFlash({ teamId: team.id, key: key.toUpperCase() })
+            clearTimeout(kbFlashRef.current)
+            kbFlashRef.current = setTimeout(() => setKbFlash(null), 600)
+
+            // update local state immediately for snappy UI
+            setBidAmount(String(newBid))
+            setWinTeamId(team.id)
+
+            // fire API
+            try {
+                const r = await fetch(`${API}/auction/assign-opening-bid`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ team_id: team.id, amount: newBid }),
+                })
+                const d = await r.json()
+                if (!r.ok) showToast(d.detail || 'Bid failed', 'error')
+            } catch {
+                showToast('Network error', 'error')
+            } finally {
+                kbBusyRef.current = false
+            }
+        }
+
+        window.addEventListener('keydown', handler)
+        return () => window.removeEventListener('keydown', handler)
+    }, [astate, allTeams, getKbIncrement, showToast])
     const markUnsold = () => doAction('unsold', '/auction/unsold')
-    const undoAction = () => doAction('undo', '/auction/undo')
-    const togglePause = () => doAction('pause', '/auction/pause')
-    const resetAuction = () => doAction('reset', '/auction/reset')
+
+    // ── Undo: fetch preview first, show confirm, then fire ─────────────────
+    const openUndoConfirm = async () => {
+        setBusy(b => ({ ...b, undopreview: true }))
+        try {
+            const r = await fetch(`${API}/auction/undo-preview`)
+            const d = await r.json()
+            setUndoPreview(d)
+            setShowUndoConfirm(true)
+        } catch { showToast('Could not fetch undo info', 'error') }
+        finally { setBusy(b => ({ ...b, undopreview: false })) }
+    }
+
+    const confirmUndo = async () => {
+        setShowUndoConfirm(false)
+        setBusy(b => ({ ...b, undo: true }))
+        try {
+            const r = await fetch(`${API}/auction/undo`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+            const d = await r.json()
+            if (!r.ok || !d.ok) showToast(d.detail || d.error || 'Undo failed', 'error')
+            else { showToast('Action undone', 'success'); fetchAll() }
+        } catch { showToast('Network error', 'error') }
+        finally { setBusy(b => ({ ...b, undo: false })) }
+    }
+
+    // ── Reset: fetch preview first, show confirm modal with live stats ──────
+    const openResetConfirm = async () => {
+        setBusy(b => ({ ...b, resetpreview: true }))
+        try {
+            const r = await fetch(`${API}/auction/reset-preview`)
+            const d = await r.json()
+            setResetPreview(d)
+            setShowResetConfirm(true)
+        } catch { showToast('Could not fetch reset info', 'error') }
+        finally { setBusy(b => ({ ...b, resetpreview: false })) }
+    }
+
+    const confirmReset = async () => {
+        setShowResetConfirm(false)
+        setResetPreview(null)
+        setBusy(b => ({ ...b, reset: true }))
+        try {
+            const r = await fetch(`${API}/auction/reset`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+            const d = await r.json()
+            if (!r.ok || !d.ok) showToast(d.detail || d.error || 'Reset failed', 'error')
+            else { showToast('Auction reset', 'success'); fetchAll() }
+        } catch { showToast('Network error', 'error') }
+        finally { setBusy(b => ({ ...b, reset: false })) }
+    }
+    const togglePause = () => doAction('pause', '/auction/pause', { paused: !isPaused })
 
     // Smart increment: returns next valid increment based on class + current bid
     const getIncrements = () => {
@@ -219,6 +437,7 @@ export default function AdminDashboard() {
     const isActive = phase === 'active'
     const isPaused = phase === 'paused'
     const isIdle = phase === 'idle'
+    isActiveRef.current = isActive
     const currentPlayer = astate?.current_player
     const leadingTeam = allTeams.find(t => t.id === astate?.current_bid_team_id)
 
@@ -330,6 +549,53 @@ export default function AdminDashboard() {
         .pi-price{font-family:var(--fd);font-size:1rem;color:var(--sub);flex-shrink:0}
         .pool-empty{padding:28px 14px;text-align:center;font-family:var(--fu);font-size:0.62rem;letter-spacing:3px;color:var(--muted);text-transform:uppercase}
 
+        /* player search */
+        .pool-search-wrap{padding:8px 10px;border-bottom:1px solid var(--border);flex-shrink:0}
+        .pool-search{width:100%;background:var(--bg-input);border:1px solid var(--border2);color:var(--text);font-family:var(--fu);font-size:0.78rem;letter-spacing:1px;padding:7px 10px;outline:none;transition:border-color 0.2s}
+        .pool-search:focus{border-color:rgba(255,215,0,0.35)}
+        .pool-search::placeholder{color:var(--muted)}
+        .pool-item.clickable{cursor:pointer;transition:background 0.12s}
+        .pool-item.clickable:hover{background:rgba(255,255,255,0.03)}
+        .pool-item.preview{background:rgba(255,215,0,0.06);border-left:2px solid var(--acc)}
+        .pool-item.preview .pi-name{color:var(--acc)}
+
+        /* keyboard flash */
+@keyframes kbFlash {
+  0%  { box-shadow: 0 0 0 0 rgba(255,215,0,0.7); border-color: rgba(255,215,0,0.9); background: rgba(255,215,0,0.18) }
+  60% { box-shadow: 0 0 0 8px rgba(255,215,0,0); }
+  100%{ box-shadow: 0 0 0 0 rgba(255,215,0,0); }
+}
+.kb-flash { animation: kbFlash 0.55s ease-out forwards !important; }
+@keyframes kbBlocked {
+  0%  { box-shadow: 0 0 0 0 rgba(248,113,113,0.8); border-color: rgba(248,113,113,0.9); background: rgba(248,113,113,0.18) }
+  60% { box-shadow: 0 0 0 8px rgba(248,113,113,0); }
+  100%{ box-shadow: 0 0 0 0 rgba(248,113,113,0); }
+}
+.kb-blocked { animation: kbBlocked 0.55s ease-out forwards !important; }
+@keyframes kbBlocked {
+  0%  { box-shadow: 0 0 0 0 rgba(248,113,113,0.8); border-color: rgba(248,113,113,0.9); background: rgba(248,113,113,0.18) }
+  60% { box-shadow: 0 0 0 8px rgba(248,113,113,0); }
+  100%{ box-shadow: 0 0 0 0 rgba(248,113,113,0); }
+}
+.kb-blocked { animation: kbBlocked 0.55s ease-out forwards !important; }
+        .kb-flash { animation: kbFlash 0.55s ease-out forwards !important; }
+        .kb-key{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid rgba(255,215,0,0.3);background:rgba(255,215,0,0.06);font-family:var(--mono);font-size:0.58rem;color:var(--acc);border-radius:2px;flex-shrink:0}
+
+        /* hotkey legend bar */
+        .kb-legend{display:flex;flex-wrap:wrap;gap:6px;padding:10px 14px;border-top:1px solid var(--border);flex-shrink:0;background:rgba(255,215,0,0.02)}
+        .kb-legend-item{display:flex;align-items:center;gap:5px;font-family:var(--fu);font-size:0.6rem;letter-spacing:1px;color:var(--muted)}
+        .preview-panel{border:1px solid rgba(255,215,0,0.2);background:rgba(255,215,0,0.03);padding:14px 16px;flex-shrink:0;animation:fadeUp 0.2s ease;display:flex;flex-direction:column;gap:10px}
+        .preview-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+        .preview-label{font-family:var(--fu);font-size:0.58rem;letter-spacing:4px;color:var(--acc);text-transform:uppercase;margin-bottom:4px}
+        .preview-name{font-family:var(--fd);font-size:1.9rem;line-height:1;color:var(--text)}
+        .preview-dismiss{background:none;border:none;cursor:pointer;color:var(--muted);padding:2px;display:flex;align-items:center;flex-shrink:0;transition:color 0.15s}
+        .preview-dismiss:hover{color:var(--text)}
+        .preview-meta{display:flex;gap:6px;flex-wrap:wrap}
+        .preview-chip{font-family:var(--fu);font-size:0.62rem;font-weight:600;letter-spacing:2px;text-transform:uppercase;padding:3px 9px;border:1px solid var(--border2);color:var(--sub)}
+        .preview-price-row{display:flex;align-items:baseline;gap:8px;padding-top:8px;border-top:1px solid var(--border2)}
+        .preview-price-label{font-family:var(--fu);font-size:0.62rem;font-weight:700;letter-spacing:3px;color:var(--muted);text-transform:uppercase}
+        .preview-price-val{font-family:var(--fd);font-size:1.5rem;color:var(--sub)}
+
         /* ── CENTER: stage ── */
         .col-c{display:flex;flex-direction:column;overflow-y:auto;padding:20px 22px;gap:18px}
 
@@ -433,7 +699,7 @@ export default function AdminDashboard() {
                         <Btn label={isPaused ? 'Resume' : 'Pause'} variant={isPaused ? 'success' : 'ghost'} onClick={togglePause} loading={busy.pause} disabled={isIdle}
                             icon={<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">{isPaused ? <polygon points="5 3 19 12 5 21 5 3" /> : <><rect x="6" y="4" width="4" height="16" /><rect x="14" y="4" width="4" height="16" /></>}</svg>}
                         />
-                        <Btn label="Undo" variant="ghost" onClick={undoAction} loading={busy.undo}
+                        <Btn label="Undo" variant="ghost" onClick={openUndoConfirm} loading={busy.undopreview || busy.undo}
                             icon={<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 7v6h6" /><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13" /></svg>}
                         />
                         <div className="tb-sep" />
@@ -442,7 +708,7 @@ export default function AdminDashboard() {
                             <div className="conn-label">{connected ? 'Connected' : 'Offline'}</div>
                         </div>
                         <div className="tb-sep" />
-                        <Btn label="Reset Auction" variant="danger" onClick={() => setShowResetConfirm(true)}
+                        <Btn label="Reset Auction" variant="danger" onClick={openResetConfirm} loading={busy.resetpreview}
                             icon={<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 .49-3.5" /></svg>}
                         />
                         <Btn label="Sign Out" variant="ghost" onClick={async () => { await supabase.auth.signOut(); router.push('/admin/login') }}
@@ -466,24 +732,61 @@ export default function AdminDashboard() {
                                 ))}
                             </div>
                         </div>
+                        {/* search input — only shown on available/unsold tabs */}
+                        {(poolFilter === 'available' || poolFilter === 'unsold') && (
+                            <div className="pool-search-wrap">
+                                <input
+                                    ref={searchInputRef}
+                                    className="pool-search"
+                                    type="text"
+                                    placeholder="Search by name…"
+                                    value={searchQuery}
+                                    onChange={e => setSearchQuery(e.target.value)}
+                                />
+                            </div>
+                        )}
                         <div className="pool-list">
                             {poolPlayers.length === 0 && <div className="pool-empty">None</div>}
-                            {poolPlayers.map(p => {
-                                const ps = posStyle(p.position)
-                                const isOn = p.id === astate?.current_player_id
-                                return (
-                                    <div key={p.id} className={`pool-item ${isOn ? 'cur' : ''}`}>
-                                        <div className="pi-pos" style={{ background: ps.bg, border: `1px solid ${ps.border}`, color: ps.text }}>
-                                            {p.position?.slice(0, 2).toUpperCase() || '—'}
-                                        </div>
-                                        <div className="pi-info">
-                                            <div className="pi-name">{p.name}</div>
-                                            <div className="pi-meta">
-                                                {p.cls ? `Class ${p.cls}` : ''}
-                                                {p.sold_to_team ? ` · ${allTeams.find(t => t.id === p.sold_to_team)?.name || 'Sold'}` : ''}
+                            {poolPlayers
+                                .filter(p => !searchQuery || p.name?.toLowerCase().includes(searchQuery.toLowerCase()))
+                                .map(p => {
+                                    const ps = posStyle(p.position)
+                                    const isOn = p.id === astate?.current_player_id
+                                    const isPreviewed = searchPreview?.id === p.id
+                                    const isSelectable = isIdle && (p.status === 'upcoming' || p.status === 'unsold')
+                                    return (
+                                        <div
+                                            key={p.id}
+                                            className={`pool-item ${isOn ? 'cur' : ''} ${isPreviewed ? 'preview' : ''} ${isSelectable ? 'clickable' : ''}`}
+                                            onClick={() => {
+                                                if (!isSelectable) return
+                                                setSearchPreview(isPreviewed ? null : p)
+                                            }}
+                                        >
+                                            <div className="pi-pos" style={{ background: ps.bg, border: `1px solid ${ps.border}`, color: ps.text }}>
+                                                {p.position?.slice(0, 2).toUpperCase() || '—'}
                                             </div>
+                                            <div className="pi-info">
+                                                <div className="pi-name">{p.name}</div>
+                                                <div className="pi-meta">
+                                                    {p.cls ? `Class ${p.cls}` : ''}
+                                                    {p.sold_to_team ? ` · ${allTeams.find(t => t.id === p.sold_to_team)?.name || 'Sold'}` : ''}
+                                                </div>
+                                            </div>
+                                            <div className="pi-price">{fmt(p.sold_price || p.base_price)}</div>
                                         </div>
-                                        <div className="pi-price">{fmt(p.sold_price || p.base_price)}</div>
+                                    )
+                                })}
+                        </div>
+                        {/* hotkey legend */}
+                        <div className="kb-legend">
+                            {Object.entries(TEAM_KEY_MAP).map(([key, name]) => {
+                                const team = allTeams.find(t => t.name.toLowerCase() === name)
+                                if (!team) return null
+                                return (
+                                    <div key={key} className="kb-legend-item">
+                                        <span className="kb-key">{key.toUpperCase()}</span>
+                                        <span>{team.name.split(' ').pop()}</span>
                                     </div>
                                 )
                             })}
@@ -623,6 +926,7 @@ export default function AdminDashboard() {
                                                     key={t.id}
                                                     onClick={() => setWinTeamId(isSelected ? '' : t.id)}
                                                     disabled={!isActive || isTeamClassLocked(t.id)}
+                                                    className={kbFlash?.teamId === t.id ? 'kb-flash' : kbBlocked?.teamId === t.id ? 'kb-blocked' : ''}
                                                     style={{
                                                         background: isSelected ? 'rgba(255,215,0,0.1)' : 'var(--bg-panel)',
                                                         border: `1px solid ${isSelected ? 'rgba(255,215,0,0.55)' : 'var(--border2)'}`,
@@ -635,13 +939,22 @@ export default function AdminDashboard() {
                                                     onMouseEnter={e => { if (isActive && !isSelected) e.currentTarget.style.borderColor = 'rgba(255,255,255,0.2)' }}
                                                     onMouseLeave={e => { if (!isSelected) e.currentTarget.style.borderColor = 'var(--border2)' }}
                                                 >
-                                                    {/* team name */}
-                                                    <div style={{ fontFamily: 'var(--fu)', fontSize: '0.72rem', fontWeight: 600, letterSpacing: '1px', color: isSelected ? 'var(--acc)' : 'var(--text)', lineHeight: 1 }}>
+                                                    {/* team name + key badge */}
+                                                    <div style={{ fontFamily: 'var(--fu)', fontSize: '0.72rem', fontWeight: 600, letterSpacing: '1px', color: isSelected ? 'var(--acc)' : 'var(--text)', lineHeight: 1, display: 'flex', alignItems: 'center', gap: 5 }}>
                                                         {t.name}
+                                                        {(() => {
+                                                            const k = Object.entries(TEAM_KEY_MAP).find(([, v]) => v === t.name.toLowerCase())?.[0]
+                                                            return k ? <span className="kb-key">{k.toUpperCase()}</span> : null
+                                                        })()}
                                                     </div>
                                                     {isTeamClassLocked(t.id) && (
                                                         <div style={{ fontFamily: 'var(--fu)', fontSize: '0.52rem', letterSpacing: '2px', color: 'var(--red)', textTransform: 'uppercase' }}>
                                                             {currentClass} quota full
+                                                        </div>
+                                                    )}
+                                                    {!isTeamClassLocked(t.id) && (t.players_bought ?? 0) >= (t.max_players ?? 8) && (
+                                                        <div style={{ fontFamily: 'var(--fu)', fontSize: '0.52rem', letterSpacing: '2px', color: 'var(--red)', textTransform: 'uppercase' }}>
+                                                            squad full
                                                         </div>
                                                     )}
                                                     {/* wallet + max bid */}
@@ -714,14 +1027,46 @@ export default function AdminDashboard() {
                             </div>
                         )}
 
+                        {/* ── PLAYER PREVIEW + PULL ── */}
+                        {searchPreview && !isActive && (
+                            <div className="preview-panel">
+                                <div className="preview-header">
+                                    <div>
+                                        <div className="preview-label">Ready to Pull</div>
+                                        <div className="preview-name">{searchPreview.name}</div>
+                                    </div>
+                                    <button className="preview-dismiss" onClick={() => setSearchPreview(null)} title="Dismiss">
+                                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                            <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                                        </svg>
+                                    </button>
+                                </div>
+                                <div className="preview-meta">
+                                    {searchPreview.position && (
+                                        <span className="preview-chip" style={(() => { const s = posStyle(searchPreview.position); return { background: s.bg, borderColor: s.border, color: s.text } })()}>
+                                            {searchPreview.position}
+                                        </span>
+                                    )}
+                                    {searchPreview.cls && <span className="preview-chip">Class {searchPreview.cls}</span>}
+                                    {searchPreview.status === 'unsold' && (
+                                        <span className="preview-chip" style={{ borderColor: 'rgba(248,113,113,0.35)', color: '#F87171' }}>Unsold</span>
+                                    )}
+                                </div>
+                                <div className="preview-price-row">
+                                    <div className="preview-price-label">Base Price</div>
+                                    <div className="preview-price-val">{fmtFull(searchPreview.base_price)}</div>
+                                </div>
+                            </div>
+                        )}
+
                         {/* ── FLOW CONTROLS ── */}
                         <div className="action-row">
                             <Btn
-                                label="Pull Next Player"
-                                variant="primary"
+                                label={searchPreview ? `Pull — ${searchPreview.name.split(' ')[0]}` : 'Select a Player'}
+                                variant={searchPreview ? 'primary' : 'default'}
                                 onClick={pullPlayer}
                                 loading={busy.pull}
-                                disabled={isActive}
+                                disabled={isActive || !searchPreview}
                                 icon={<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="16" /><line x1="8" y1="12" x2="16" y2="12" /></svg>}
                             />
                             <div style={{ flex: 1 }} />
@@ -789,16 +1134,72 @@ export default function AdminDashboard() {
                     </div>
                 </div>
             </div>
+            {/* ── UNDO CONFIRM MODAL ── */}
+            {showUndoConfirm && (
+                <div style={{ position: 'fixed', inset: 0, zIndex: 300, background: 'rgba(6,8,16,0.92)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <div style={{ background: '#0D1117', border: '1px solid rgba(251,146,60,0.3)', width: 420, padding: '28px 28px 24px', boxShadow: '0 20px 80px rgba(0,0,0,0.9)' }}>
+                        <div style={{ fontFamily: 'var(--fd)', fontSize: '1.8rem', letterSpacing: '1px', color: 'var(--orange)', marginBottom: 12 }}>Confirm Undo</div>
+                        {undoPreview?.action ? (
+                            <>
+                                <div style={{ fontFamily: 'var(--fu)', fontSize: '0.7rem', letterSpacing: '2px', color: 'var(--muted)', textTransform: 'uppercase', marginBottom: 6 }}>Last action</div>
+                                <div style={{ fontFamily: 'var(--fu)', fontSize: '0.88rem', fontWeight: 700, color: 'var(--text)', padding: '10px 14px', background: 'rgba(251,146,60,0.06)', border: '1px solid rgba(251,146,60,0.2)', marginBottom: 8 }}>
+                                    {undoPreview.action.replace(/_/g, ' ').toUpperCase()}
+                                </div>
+                                {undoPreview.payload && Object.keys(undoPreview.payload).length > 0 && (
+                                    <div style={{ fontFamily: 'var(--mono)', fontSize: '0.65rem', color: 'var(--muted)', marginBottom: 16, lineHeight: 1.6 }}>
+                                        {Object.entries(undoPreview.payload).map(([k, v]) => (
+                                            <div key={k}><span style={{ color: 'var(--sub)' }}>{k}:</span> {String(v)}</div>
+                                        ))}
+                                    </div>
+                                )}
+                                <div style={{ fontFamily: 'var(--fu)', fontSize: '0.75rem', color: 'var(--sub)', marginBottom: 22, lineHeight: 1.6 }}>
+                                    This will reverse the action above and restore the previous auction state.
+                                </div>
+                            </>
+                        ) : (
+                            <div style={{ fontFamily: 'var(--fu)', fontSize: '0.82rem', color: 'var(--muted)', marginBottom: 22 }}>
+                                {undoPreview?.description || 'Nothing to undo.'}
+                            </div>
+                        )}
+                        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+                            <Btn label="Cancel" variant="ghost" onClick={() => { setShowUndoConfirm(false); setUndoPreview(null) }} />
+                            <Btn label="Yes, Undo" variant="warning" loading={busy.undo} disabled={!undoPreview?.action} onClick={confirmUndo} />
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ── RESET CONFIRM MODAL ── */}
             {showResetConfirm && (
                 <div style={{ position: 'fixed', inset: 0, zIndex: 300, background: 'rgba(6,8,16,0.92)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <div style={{ background: '#0D1117', border: '1px solid rgba(248,113,113,0.3)', width: 420, padding: '28px 28px 24px', boxShadow: '0 20px 80px rgba(0,0,0,0.9)' }}>
-                        <div style={{ fontFamily: 'var(--fd)', fontSize: '1.8rem', letterSpacing: '1px', color: 'var(--red)', marginBottom: 12 }}>Reset Auction</div>
-                        <div style={{ fontFamily: 'var(--fu)', fontSize: '0.82rem', fontWeight: 600, color: 'var(--sub)', lineHeight: 1.6, marginBottom: 24 }}>
-                            This will reset the entire auction to its initial state. All player sales, bids, and wallet deductions will be wiped. This cannot be undone.
+                    <div style={{ background: '#0D1117', border: '1px solid rgba(248,113,113,0.3)', width: 460, padding: '28px 28px 24px', boxShadow: '0 20px 80px rgba(0,0,0,0.9)' }}>
+                        <div style={{ fontFamily: 'var(--fd)', fontSize: '1.8rem', letterSpacing: '1px', color: 'var(--red)', marginBottom: 6 }}>Reset Auction</div>
+                        <div style={{ fontFamily: 'var(--fu)', fontSize: '0.7rem', letterSpacing: '3px', color: 'var(--red)', textTransform: 'uppercase', marginBottom: 18, opacity: 0.7 }}>This cannot be undone</div>
+
+                        {/* live stats of what will be wiped */}
+                        {resetPreview && !resetPreview.error && (
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 18 }}>
+                                {[
+                                    { label: 'Players sold', value: resetPreview.sold_players, warn: resetPreview.sold_players > 0 },
+                                    { label: 'Bids recorded', value: resetPreview.bids, warn: resetPreview.bids > 0 },
+                                    { label: 'Log entries', value: resetPreview.log_entries, warn: false },
+                                    { label: 'Teams resetting', value: resetPreview.teams?.length ?? '—', warn: false },
+                                ].map(s => (
+                                    <div key={s.label} style={{ padding: '10px 14px', background: s.warn ? 'rgba(248,113,113,0.06)' : 'rgba(255,255,255,0.02)', border: `1px solid ${s.warn ? 'rgba(248,113,113,0.25)' : 'var(--border2)'}` }}>
+                                        <div style={{ fontFamily: 'var(--fd)', fontSize: '1.5rem', color: s.warn ? 'var(--red)' : 'var(--sub)', lineHeight: 1 }}>{s.value}</div>
+                                        <div style={{ fontFamily: 'var(--fu)', fontSize: '0.58rem', letterSpacing: '2px', color: 'var(--muted)', textTransform: 'uppercase', marginTop: 4 }}>{s.label}</div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        <div style={{ fontFamily: 'var(--fu)', fontSize: '0.78rem', fontWeight: 600, color: 'var(--sub)', lineHeight: 1.7, marginBottom: 20 }}>
+                            All player sales, bids, wallets, and rosters will be wiped. Every team wallet resets to <span style={{ color: 'var(--acc)' }}>₹2,00,000</span>. Diamond players are retained.
                         </div>
+
                         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-                            <Btn label="Cancel" variant="ghost" onClick={() => setShowResetConfirm(false)} />
-                            <Btn label="Yes, Reset Everything" variant="danger" loading={busy.reset} onClick={() => { resetAuction(); setShowResetConfirm(false) }} />
+                            <Btn label="Cancel" variant="ghost" onClick={() => { setShowResetConfirm(false); setResetPreview(null) }} />
+                            <Btn label="Yes, Reset Everything" variant="danger" loading={busy.reset} onClick={confirmReset} />
                         </div>
                     </div>
                 </div>

@@ -320,10 +320,11 @@ const getTeamGradient = (teamId) => {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+const supabase = createClient()
+
 export default function TeamRosterPage() {
     const { id: teamId } = useParams()
     const router = useRouter()
-    const supabase = useMemo(() => createClient(), [])
 
     const [myTeam, setMyTeam] = useState(null)
     const [allTeams, setAllTeams] = useState([])
@@ -341,6 +342,70 @@ export default function TeamRosterPage() {
 
     const [toast, setToast] = useState(null)
     const toastRef = useRef(null)
+
+    // ── SOLD / UNSOLD banner ──────────────────────────────────────────────
+    const [soldAnim, setSoldAnim] = useState(null)   // { player, team, leaving }
+    const [unsoldAnim, setUnsoldAnim] = useState(null) // { player, leaving }
+    const soldAnimRef = useRef(null)
+    const soldLeaveRef = useRef(null)
+    const unsoldAnimRef = useRef(null)
+    const unsoldLeaveRef = useRef(null)
+    const gavelAudioRef = useRef(null)
+    const unsoldAudioRef = useRef(null)
+
+    const playGavel = useCallback(() => {
+        try {
+            if (!gavelAudioRef.current) {
+                gavelAudioRef.current = new Audio('/sounds/gavel.wav')
+                gavelAudioRef.current.volume = 0.85
+            }
+            gavelAudioRef.current.currentTime = 0
+            gavelAudioRef.current.play().catch(() => { })
+        } catch (e) { }
+    }, [])
+
+    const playUnsold = useCallback(() => {
+        try {
+            if (!unsoldAudioRef.current) {
+                const audio = new Audio('/sounds/unsold.mp3')
+                audio.volume = 0.75
+                audio.preload = 'auto'
+                unsoldAudioRef.current = audio
+            }
+            unsoldAudioRef.current.currentTime = 0
+            const playPromise = unsoldAudioRef.current.play()
+            if (playPromise !== undefined) {
+                playPromise.catch(err => {
+                    console.warn("[Audio] Unsold sound failed to play:", err)
+                })
+            }
+        } catch (e) {
+            console.error("[Audio] Unsold sound error:", e)
+        }
+    }, [])
+
+    const triggerSoldAnim = useCallback((playerRow, teamRow) => {
+        clearTimeout(soldAnimRef.current)
+        clearTimeout(soldLeaveRef.current)
+        setSoldAnim({ player: playerRow, team: teamRow, leaving: false })
+        playGavel()
+        soldAnimRef.current = setTimeout(() => {
+            setSoldAnim(prev => prev ? { ...prev, leaving: true } : null)
+            soldLeaveRef.current = setTimeout(() => setSoldAnim(null), 400)
+        }, 4200)
+    }, [playGavel])
+
+    const triggerUnsoldAnim = useCallback((playerRow) => {
+        clearTimeout(unsoldAnimRef.current)
+        clearTimeout(unsoldLeaveRef.current)
+        setUnsoldAnim({ player: playerRow, leaving: false })
+        playUnsold()
+        unsoldAnimRef.current = setTimeout(() => {
+            setUnsoldAnim(prev => prev ? { ...prev, leaving: true } : null)
+            unsoldLeaveRef.current = setTimeout(() => setUnsoldAnim(null), 400)
+        }, 3500)
+    }, [playUnsold])
+
     const showToast = (msg, type = 'info') => {
         setToast({ msg, type })
         clearTimeout(toastRef.current)
@@ -349,6 +414,7 @@ export default function TeamRosterPage() {
 
     const watchIds = watchlist.map(p => p.id)
 
+    // ── Full load via FastAPI (initial only) ─────────────────────────────
     const fetchAll = useCallback(async () => {
         try {
             const [sr, rr, wlr, pr] = await Promise.all([
@@ -358,40 +424,108 @@ export default function TeamRosterPage() {
                 fetch(`${API}/players/`),
             ])
             if (sr.ok) {
-                const d = await sr.json();
-                setAstate(d);
-                const teams = d.teams || [];
-                setAllTeams(teams);
-                const t = teams.find(x => String(x.id).toLowerCase() === String(teamId).toLowerCase());
-                if (t) setMyTeam(t);
-                else console.warn(`Team Dashboard: Could not find team with ID ${teamId} in teams list`, teams);
+                const d = await sr.json()
+                setAstate(d)
+                const teams = d.teams || []
+                setAllTeams(teams)
+                const t = teams.find(x => String(x.id).toLowerCase() === String(teamId).toLowerCase())
+                if (t) setMyTeam(t)
+                else console.warn(`Team Dashboard: Could not find team with ID ${teamId} in teams list`, teams)
             }
             if (rr.ok) setSquad(await rr.json())
             if (wlr.ok) setWatchlist(await wlr.json())
             if (pr.ok) {
-                const all = await pr.json();
+                const all = await pr.json()
                 setAvPlayers(all.filter(p => p.status === 'upcoming' || p.status === 'unsold'))
             }
         } catch (err) {
-            console.error("Team Dashboard fetch error:", err);
+            console.error("Team Dashboard fetch error:", err)
         }
     }, [teamId])
 
+    // ── Fast direct Supabase reads — bypasses FastAPI entirely (~30-80ms) ─
+    const fastRefreshAuction = useCallback(async () => {
+        try {
+            const { data: stateRow } = await supabase
+                .from('auction_state').select('*').eq('id', 1).single()
+            if (!stateRow) return
+
+            let currentPlayer = null
+            if (stateRow.current_player_id) {
+                const { data: p } = await supabase
+                    .from('players').select('*').eq('id', stateRow.current_player_id).single()
+                if (p) { p.cls = p.class; p.sold_price = p.sold_amount; currentPlayer = p }
+            }
+
+            const { data: teamsRaw } = await supabase.from('teams').select('*').order('name')
+            const teams = (teamsRaw || []).map(t => ({
+                ...t, players_bought: t.roster_count ?? 0,
+                max_players: t.max_slots ?? 0, max_wallet: 200000,
+            }))
+
+            let phase = stateRow.phase
+            if (stateRow.is_paused && phase === 'active') phase = 'paused'
+
+            setAstate({
+                ...stateRow, phase, current_player: currentPlayer,
+                current_bid_team_id: stateRow.current_bid_team, teams, action_log: []
+            })
+            setAllTeams(teams)
+            const me = teams.find(x => String(x.id).toLowerCase() === String(teamId).toLowerCase())
+            if (me) setMyTeam(me)
+        } catch (err) { console.error('Fast auction refresh error:', err) }
+    }, [teamId])
+
+    const fastRefreshRoster = useCallback(async () => {
+        try {
+            const { data } = await supabase.from('players').select('*')
+                .eq('sold_to_team', teamId).eq('status', 'sold')
+            setSquad((data || []).map(p => ({ ...p, cls: p.class, sold_price: p.sold_amount })))
+        } catch (err) { console.error('Fast roster refresh error:', err) }
+    }, [teamId])
+
+    const fastRefreshAvailable = useCallback(async () => {
+        try {
+            const { data } = await supabase.from('players').select('*').in('status', ['upcoming', 'unsold'])
+            setAvPlayers((data || []).map(p => ({ ...p, cls: p.class, sold_price: p.sold_amount })))
+        } catch (err) { console.error('Fast available refresh error:', err) }
+    }, [])
+
     useEffect(() => { fetchAll().finally(() => setLoading(false)) }, [])
-    // always keep ref pointing to latest fetchAll so realtime never calls a stale closure
-    const fetchAllRef = useRef(fetchAll)
-    useEffect(() => { fetchAllRef.current = fetchAll }, [fetchAll])
 
     useEffect(() => {
-        const ch = supabase.channel(`team-ro-${teamId}`)
-            .on('postgres_changes', { event: '*', schema: 'public', table: 'auction_state' }, () => fetchAllRef.current())
-            .on('postgres_changes', { event: '*', schema: 'public', table: 'players' }, () => fetchAllRef.current())
-            .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, () => fetchAllRef.current())
-            .on('postgres_changes', { event: '*', schema: 'public', table: 'watchlist' }, () => fetchAllRef.current())
+        const ch = supabase.channel(`team-rt-${teamId}`)
+            // hot path: bid placed → auction_state row updated → re-read directly
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'auction_state' },
+                () => fastRefreshAuction())
+            // wallet/roster count changed
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' },
+                () => fastRefreshAuction())
+            // player sold/pulled/unsold
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'players' },
+                async (payload) => {
+                    fastRefreshAuction(); fastRefreshRoster(); fastRefreshAvailable()
+                    const row = payload?.new
+                    if (row?.status === 'sold' && row?.sold_to_team) {
+                        const { data: teamRow } = await supabase
+                            .from('teams').select('*').eq('id', row.sold_to_team).single()
+                        const playerRow = { ...row, cls: row.class, sold_price: row.sold_amount }
+                        if (teamRow) triggerSoldAnim(playerRow, teamRow)
+                    } else if (row?.status === 'unsold') {
+                        const playerRow = { ...row, cls: row.class, sold_price: row.sold_amount }
+                        triggerUnsoldAnim(playerRow)
+                    }
+                })
+            // watchlist — not time-critical, FastAPI is fine
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'watchlist' },
+                async () => {
+                    const r = await fetch(`${API}/teams/${teamId}/watchlist`)
+                    if (r.ok) setWatchlist(await r.json())
+                })
             .on('system', {}, p => setConnected(p.status === 'SUBSCRIBED'))
             .subscribe(s => setConnected(s === 'SUBSCRIBED'))
         return () => supabase.removeChannel(ch)
-    }, [teamId])
+    }, [teamId, fastRefreshAuction, fastRefreshRoster, fastRefreshAvailable, triggerSoldAnim, triggerUnsoldAnim])
 
     const toggleWatch = async (playerId) => {
         const inList = watchIds.includes(playerId)
@@ -458,6 +592,82 @@ export default function TeamRosterPage() {
         @keyframes fadeUp {from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
         @keyframes toastIn{from{opacity:0;transform:translateX(14px)}to{opacity:1;transform:translateX(0)}}
         @keyframes bidPulse{0%,100%{opacity:1}50%{opacity:0.6}}
+
+        /* ── banner animations ── */
+        @keyframes soldIn      {from{opacity:0;transform:translateY(-100%)}to{opacity:1;transform:translateY(0)}}
+        @keyframes soldOut     {from{opacity:1;transform:translateY(0)}to{opacity:0;transform:translateY(-100%)}}
+        @keyframes soldStamp   {0%{opacity:0;transform:scale(2.4) rotate(-14deg)}55%{opacity:1;transform:scale(0.9) rotate(-6deg)}75%{transform:scale(1.06) rotate(-6deg)}100%{opacity:1;transform:scale(1) rotate(-6deg)}}
+        @keyframes soldPriceIn {from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes soldPhotoIn {from{opacity:0;transform:scale(1.06)}to{opacity:1;transform:scale(1)}}
+        @keyframes soldParticle{0%{transform:translate(0,0) scale(1);opacity:1}100%{transform:translate(var(--dx),var(--dy)) scale(0);opacity:0}}
+        @keyframes soldSweep   {from{transform:scaleX(0)}to{transform:scaleX(1)}}
+        @keyframes bannerScan  {0%{transform:translateY(-100%)}100%{transform:translateY(400%)}}
+
+        .sold-banner{
+          position:fixed;top:0;left:0;right:0;z-index:500;
+          display:grid;grid-template-columns:120px 1fr auto auto;
+          align-items:stretch;gap:0;
+          background:linear-gradient(180deg,#0a0d1a 0%,#060810 100%);
+          border-bottom:3px solid;
+          animation:soldIn 0.45s cubic-bezier(0.16,1,0.3,1);
+          overflow:hidden;
+          box-shadow:0 12px 60px rgba(0,0,0,0.9);
+        }
+        .sold-banner.leaving{animation:soldOut 0.35s ease-in forwards}
+        .unsold-banner{
+          position:fixed;top:0;left:0;right:0;z-index:500;
+          display:grid;grid-template-columns:120px 1fr auto;
+          align-items:stretch;gap:0;
+          background:linear-gradient(180deg,#0a0d1a 0%,#060810 100%);
+          border-bottom:3px solid rgba(248,113,113,0.7);
+          animation:soldIn 0.45s cubic-bezier(0.16,1,0.3,1);
+          overflow:hidden;
+          box-shadow:0 12px 60px rgba(0,0,0,0.9);
+        }
+        .unsold-banner.leaving{animation:soldOut 0.35s ease-in forwards}
+
+        .banner-scanline{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:10;overflow:hidden}
+        .banner-scanline::after{content:'';position:absolute;left:0;right:0;height:25%;background:linear-gradient(180deg,transparent,rgba(255,255,255,0.025),transparent);animation:bannerScan 2.5s linear 0.5s infinite}
+
+        .sb-photo{width:120px;height:120px;flex-shrink:0;overflow:hidden;position:relative;border-right:1px solid rgba(255,255,255,0.06)}
+        .sb-photo img{width:100%;height:100%;object-fit:cover;object-position:center 15%;animation:soldPhotoIn 0.5s ease}
+        .sb-photo-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#0F1320}
+        .sb-photo-stamp{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;background:rgba(6,8,16,0.5)}
+        .sb-photo-stamp-inner{font-family:var(--fd);font-size:1.9rem;letter-spacing:4px;padding:5px 10px;border:3px solid;line-height:1;animation:soldStamp 0.55s 1.5s cubic-bezier(0.16,1,0.3,1) both}
+        .sb-player{padding:16px 22px;min-width:0;display:flex;flex-direction:column;justify-content:center}
+        .sb-eyebrow{font-family:var(--fu);font-size:0.52rem;font-weight:800;letter-spacing:5px;text-transform:uppercase;margin-bottom:5px;display:flex;align-items:center;gap:8px}
+        .sb-eyebrow.sold-lbl{color:#4ADE80}
+        .sb-eyebrow.unsold-lbl{color:#F87171}
+        .sb-eye-line{flex:1;height:1px;transform-origin:left;animation:soldSweep 0.6s 0.2s ease forwards;transform:scaleX(0)}
+        .sb-eye-line.sold-lbl{background:rgba(74,222,128,0.2)}
+        .sb-eye-line.unsold-lbl{background:rgba(248,113,113,0.2)}
+        .sb-name{font-family:var(--fd);font-size:3rem;letter-spacing:1px;line-height:1;color:#EEF2FF;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .sb-badges{display:flex;gap:6px;margin-top:7px;flex-wrap:wrap}
+        .sb-badge{font-family:var(--fu);font-size:0.55rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:3px 9px;border:1px solid}
+        .sb-team{padding:16px 26px;border-left:1px solid rgba(255,255,255,0.06);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;flex-shrink:0;min-width:160px}
+        .sb-to-lbl{font-family:var(--fu);font-size:0.52rem;font-weight:800;letter-spacing:4px;text-transform:uppercase;color:var(--muted)}
+        .sb-team-logo{width:44px;height:44px;border-radius:8px;object-fit:cover;border:1.5px solid;display:block}
+        .sb-team-name{font-family:var(--fd);font-size:1.9rem;letter-spacing:1px;line-height:1;text-align:center}
+        .sb-price{padding:16px 30px;border-left:1px solid rgba(255,255,255,0.06);display:flex;flex-direction:column;align-items:flex-end;justify-content:center;flex-shrink:0;position:relative}
+        .sb-price-lbl{font-family:var(--fu);font-size:0.52rem;font-weight:800;letter-spacing:4px;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+        .sb-price-val{font-family:var(--fd);font-size:3.2rem;letter-spacing:2px;line-height:1;animation:soldPriceIn 0.4s 0.15s ease both}
+        .sb-unsold-note{padding:16px 34px;border-left:1px solid rgba(248,113,113,0.15);display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0}
+        .sb-unsold-note-lbl{font-family:var(--fu);font-size:0.52rem;font-weight:800;letter-spacing:4px;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+        .sb-unsold-note-val{font-family:var(--fd);font-size:2.2rem;letter-spacing:1px;color:#F87171;line-height:1;animation:soldPriceIn 0.4s 0.15s ease both}
+        .sb-particles{position:absolute;inset:0;pointer-events:none;overflow:visible}
+        .sb-p{position:absolute;border-radius:50%;animation:soldParticle 0.9s ease-out both}
+        @media(max-width:600px){
+          .sold-banner,.unsold-banner{grid-template-columns:80px 1fr auto}
+          .sb-photo{width:80px;height:80px}
+          .sb-name{font-size:1.9rem}
+          .sb-price-val{font-size:2rem}
+          .sb-team-name{font-size:1.3rem}
+          .sb-unsold-note-val{font-size:1.4rem}
+          .sb-photo-stamp-inner{font-size:1.2rem}
+          .sb-team{padding:10px 14px;min-width:unset}
+          .sb-price{padding:10px 16px}
+          .sb-team-logo{width:32px;height:32px}
+        }
 
         .page {
           position: relative;
@@ -632,12 +842,76 @@ export default function TeamRosterPage() {
           .sidebar{display:none}
           .sum-grid{grid-template-columns:repeat(2,1fr)}
         }
-        @media(max-width:500px){
-          .topbar,.content,.no-live,.tabs{padding-left:18px;padding-right:18px}
-          .otb-name{font-size:1.4rem}
-          .otb-bid-amt{font-size:1.6rem}
-          .otb-bid{min-width:120px;padding:12px 16px}
+
+        /* ── MOBILE FULL OVERHAUL (≤600px) ── */
+        @media(max-width:600px){
+          /* topbar: compact */
+          .topbar{padding:0 14px;height:52px;position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+          .team-name-hdr{font-size:1.1rem;letter-spacing:1px}
+          .tsep,.conn-row{display:none}
+          .wallet-chip{font-size:0.75rem;padding:4px 10px}
+
+          /* on-the-block: stack vertically */
+          .otb-inner{grid-template-columns:64px 1fr;grid-template-rows:auto auto}
+          .otb-photo-wrap{width:64px}
+          .otb-photo{width:64px;min-height:72px}
+          .otb-photo-fallback{width:64px;min-height:72px}
+          .otb-center{padding:10px 12px;gap:5px}
+          .otb-name{font-size:1.6rem}
+          .otb-bid{
+            grid-column:1/-1;
+            border-left:none;border-top:1px solid var(--border2);
+            flex-direction:row;align-items:center;justify-content:space-between;
+            padding:10px 14px;min-width:unset;
+          }
+          .otb-bid-amt{font-size:1.8rem}
+          .otb-bid-lbl{font-size:0.72rem}
+
+          /* tabs: full width, even split */
+          .tabs{padding:0;overflow-x:auto;-webkit-overflow-scrolling:touch}
+          .tab-btn{flex:1;justify-content:center;padding:12px 0;margin-right:0;font-size:0.7rem;letter-spacing:2px;border-bottom-width:3px}
+
+          /* content padding */
+          .content{padding:16px 14px 80px}
+
+          /* summary grid: 2 col */
+          .sum-grid{grid-template-columns:repeat(2,1fr)}
+          .sum-val{font-size:1.6rem}
+          .sum-lbl{font-size:0.65rem}
+
+          /* squad rows: tighter */
+          .sq-row{grid-template-columns:52px 1fr auto}
+          .sq-photo{width:52px;height:68px}
+          .sq-name{font-size:1.15rem}
+          .sq-price{font-size:1.2rem;padding:8px 12px}
+          .sq-info{padding:8px 10px}
+
+          /* available grid: 2 col */
+          .av-grid{grid-template-columns:repeat(2,1fr)}
+
+          /* wallet bar */
+          .wbrow{font-size:0.65rem}
+
+          /* strategy cards: stack */
+          .strategy-card{padding:10px 12px}
+          .strategy-label{font-size:0.7rem}
+          .strategy-need{font-size:1.1rem}
+
+          /* sticky bid bar at bottom when active */
+          .mob-bid-bar{
+            display:flex;
+            position:fixed;bottom:0;left:0;right:0;z-index:200;
+            align-items:center;justify-content:space-between;
+            padding:10px 16px;
+            background:rgba(6,8,16,0.97);
+            border-top:1px solid var(--border);
+            backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+            gap:12px;
+          }
+          .mob-bid-bar-hidden{display:none}
         }
+        /* hide mob-bid-bar on desktop */
+        @media(min-width:601px){.mob-bid-bar,.mob-bid-bar-hidden{display:none!important}}
       `}</style>
 
             {toast && <div className={`toast ${toast.type}`}>{toast.msg}</div>}
@@ -1093,6 +1367,120 @@ export default function TeamRosterPage() {
                     </div>
                 </div>
             </div >
+
+            {/* ── MOBILE STICKY BID BAR (≤600px, only when active) ── */}
+            <div className={isActive && currentPlayer ? 'mob-bid-bar' : 'mob-bid-bar-hidden'}>
+                <div style={{ minWidth: 0 }}>
+                    <div style={{ fontFamily: 'var(--fu)', fontSize: '0.52rem', fontWeight: 800, letterSpacing: '3px', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 2 }}>On Block</div>
+                    <div style={{ fontFamily: 'var(--fd)', fontSize: '1rem', letterSpacing: '1px', color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '130px' }}>{currentPlayer?.name || '—'}</div>
+                </div>
+                <div style={{ textAlign: 'center', flexShrink: 0 }}>
+                    <div style={{ fontFamily: 'var(--fu)', fontSize: '0.52rem', fontWeight: 800, letterSpacing: '3px', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 2 }}>Current Bid</div>
+                    <div style={{ fontFamily: 'var(--fd)', fontSize: '1.5rem', letterSpacing: '2px', color: 'var(--acc)', lineHeight: 1 }}>
+                        {astate?.current_bid ? fmtFull(astate.current_bid) : fmtFull(currentPlayer?.base_price)}
+                    </div>
+                </div>
+                <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                    <div style={{ fontFamily: 'var(--fu)', fontSize: '0.52rem', fontWeight: 800, letterSpacing: '3px', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 2 }}>Leading</div>
+                    {astate?.current_bid_team_id ? (
+                        <div style={{ fontFamily: 'var(--fd)', fontSize: '1rem', letterSpacing: '1px', color: isMyBid ? 'var(--acc)' : 'var(--sub)', lineHeight: 1 }}>
+                            {isMyBid ? '▲ YOU' : (allTeams.find(t => t.id === astate.current_bid_team_id)?.name?.split(' ').pop() || '—')}
+                        </div>
+                    ) : (
+                        <div style={{ fontFamily: 'var(--fu)', fontSize: '0.65rem', color: 'var(--muted)' }}>No bids</div>
+                    )}
+                </div>
+            </div>
+
+            {/* ── SOLD BANNER ── */}
+            {soldAnim && (() => {
+                const colour = teamColour(soldAnim.team.id)
+                const rgb = hexToRgb(colour)
+                const price = soldAnim.player.sold_price || soldAnim.player.sold_amount
+                const ps = soldAnim.player.position ? posStyle(soldAnim.player.position) : null
+                const cc = soldAnim.player.cls ? classCfg(soldAnim.player.cls) : null
+                const particles = Array.from({ length: 18 }, (_, i) => {
+                    const angle = (i / 18) * 2 * Math.PI
+                    const dist = 55 + Math.random() * 55
+                    return { dx: Math.cos(angle) * dist, dy: Math.sin(angle) * dist, delay: i * 0.04, size: 4 + Math.random() * 5 }
+                })
+                return (
+                    <div className={`sold-banner${soldAnim.leaving ? ' leaving' : ''}`}
+                        style={{ borderBottomColor: colour, boxShadow: `0 12px 60px rgba(0,0,0,0.9), 0 0 0 1px rgba(${rgb},0.15) inset` }}>
+                        <div className="banner-scanline" />
+                        <div className="sb-photo" style={{ borderRightColor: `rgba(${rgb},0.15)` }}>
+                            <img src={soldAnim.player.photo_url || `/images/players/${soldAnim.player.id}.jpg`} alt={soldAnim.player.name}
+                                onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex' }} />
+                            <div className="sb-photo-fallback" style={{ display: 'none' }}>
+                                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke={`rgba(${rgb},0.3)`} strokeWidth="1"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg>
+                            </div>
+                            <div className="sb-photo-stamp">
+                                <div className="sb-photo-stamp-inner" style={{ borderColor: colour, color: colour }}>SOLD</div>
+                            </div>
+                            <div className="sb-particles">
+                                {particles.map((p, i) => (
+                                    <div key={i} className="sb-p" style={{ background: colour, width: p.size, height: p.size, top: '50%', left: '50%', '--dx': `${p.dx}px`, '--dy': `${p.dy}px`, animationDelay: `${1.5 + p.delay}s`, opacity: 0.85 }} />
+                                ))}
+                            </div>
+                        </div>
+                        <div className="sb-player">
+                            <div className="sb-eyebrow sold-lbl">SOLD<div className="sb-eye-line sold-lbl" /></div>
+                            <div className="sb-name">{soldAnim.player.name}</div>
+                            <div className="sb-badges">
+                                {ps && <span className="sb-badge" style={{ background: ps.bg, borderColor: ps.border, color: ps.text }}>{soldAnim.player.position}</span>}
+                                {cc && <span className="sb-badge" style={{ background: cc.bg, borderColor: cc.border, color: cc.color }}>{soldAnim.player.cls}</span>}
+                            </div>
+                        </div>
+                        <div className="sb-team" style={{ borderLeftColor: `rgba(${rgb},0.15)` }}>
+                            <div className="sb-to-lbl">Goes to</div>
+                            <img className="sb-team-logo" src={`/images/teams/${soldAnim.team.id}.png`} alt=""
+                                style={{ borderColor: `rgba(${rgb},0.5)`, boxShadow: `0 0 12px rgba(${rgb},0.25)` }}
+                                onError={e => e.target.style.display = 'none'} />
+                            <div className="sb-team-name" style={{ color: colour }}>{soldAnim.team.name}</div>
+                        </div>
+                        <div className="sb-price" style={{ borderLeftColor: `rgba(${rgb},0.15)` }}>
+                            <div className="sb-price-lbl">Final Price</div>
+                            <div className="sb-price-val" style={{ color: colour }}>{fmtFull(price)}</div>
+                        </div>
+                    </div>
+                )
+            })()}
+
+            {/* ── UNSOLD BANNER ── */}
+            {unsoldAnim && (() => {
+                const ps = unsoldAnim.player.position ? posStyle(unsoldAnim.player.position) : null
+                const cc = unsoldAnim.player.cls ? classCfg(unsoldAnim.player.cls) : null
+                return (
+                    <div className={`unsold-banner${unsoldAnim.leaving ? ' leaving' : ''}`}>
+                        <div className="banner-scanline" />
+                        <div className="sb-photo" style={{ borderRightColor: 'rgba(248,113,113,0.15)' }}>
+                            <img src={unsoldAnim.player.photo_url || `/images/players/${unsoldAnim.player.id}.jpg`} alt={unsoldAnim.player.name}
+                                onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex' }} />
+                            <div className="sb-photo-fallback" style={{ display: 'none' }}>
+                                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(248,113,113,0.3)" strokeWidth="1"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg>
+                            </div>
+                            <div className="sb-photo-stamp">
+                                <div className="sb-photo-stamp-inner" style={{ borderColor: '#F87171', color: '#F87171' }}>UNSOLD</div>
+                            </div>
+                        </div>
+                        <div className="sb-player">
+                            <div className="sb-eyebrow unsold-lbl">UNSOLD<div className="sb-eye-line unsold-lbl" /></div>
+                            <div className="sb-name">{unsoldAnim.player.name}</div>
+                            <div className="sb-badges">
+                                {ps && <span className="sb-badge" style={{ background: ps.bg, borderColor: ps.border, color: ps.text }}>{unsoldAnim.player.position}</span>}
+                                {cc && <span className="sb-badge" style={{ background: cc.bg, borderColor: cc.border, color: cc.color }}>{unsoldAnim.player.cls}</span>}
+                                {unsoldAnim.player.base_price && (
+                                    <span className="sb-badge" style={{ borderColor: 'rgba(255,255,255,0.1)', color: 'var(--muted)' }}>Base {fmtFull(unsoldAnim.player.base_price)}</span>
+                                )}
+                            </div>
+                        </div>
+                        <div className="sb-unsold-note">
+                            <div className="sb-unsold-note-lbl">Returns to pool</div>
+                            <div className="sb-unsold-note-val">No bids</div>
+                        </div>
+                    </div>
+                )
+            })()}
         </>
     )
 }

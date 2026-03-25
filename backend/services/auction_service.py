@@ -186,47 +186,87 @@ def pause_auction(paused: bool):
 
 def undo_last():
     supabase = get_supabase()
-    res = supabase.rpc("undo_last_action", {}).execute()
-    return res.data
+    try:
+        res = supabase.rpc("undo_last_action", {}).execute()
+        data = res.data
+
+        # RPC may return None, a bool, or a dict — normalise all cases
+        if data is None:
+            return {"ok": False, "error": "Nothing to undo"}
+
+        if isinstance(data, bool):
+            return {"ok": data, "error": None if data else "Undo failed — nothing to reverse"}
+
+        if isinstance(data, dict):
+            # Pass through if RPC already returns {ok, error}
+            if "ok" in data:
+                return data
+            # Otherwise wrap it
+            return {"ok": True, "data": data}
+
+        return {"ok": True}
+
+    except Exception as e:
+        return {"ok": False, "error": f"Undo error: {str(e)}"}
 
 def reset_auction():
     supabase = get_supabase()
-    from datetime import datetime, timezone
+    errors = []
 
-    # Reset all non-diamond players to upcoming, clear sale info
-    supabase.table("players").update({
-        "status":       "upcoming",
-        "sold_to_team": None,
-        "sold_amount":  None,
-    }).neq("class", "Diamond").execute()
+    try:
+        # 1. Reset ALL non-diamond players → upcoming, clear sale info
+        #    Covers upcoming, unsold, active, and sold statuses in one shot
+        supabase.table("players").update({
+            "status":       "upcoming",
+            "sold_to_team": None,
+            "sold_amount":  None,
+        }).neq("class", "Diamond").execute()
+    except Exception as e:
+        errors.append(f"players: {e}")
 
-    # Reset teams: wallet back to 300000, roster_count to 1 (diamond retained)
-    supabase.table("teams").update({
-        "wallet":       300000,
-        "roster_count": 1,
-    }).neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    try:
+        # 2. Reset ALL teams — wallet to 200000, roster_count to 1 (retains diamond slot)
+        supabase.table("teams").update({
+            "wallet":       200000,
+            "roster_count": 1,
+        }).neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    except Exception as e:
+        errors.append(f"teams: {e}")
 
-    # Clear bids + deadlock_bids
-    supabase.table("bids").delete().neq("id", -1).execute()
-    supabase.table("deadlock_bids").delete().neq("id", -1).execute()
+    try:
+        # 3. Wipe bids + deadlock_bids
+        supabase.table("bids").delete().neq("id", -1).execute()
+    except Exception as e:
+        errors.append(f"bids: {e}")
 
+    try:
+        supabase.table("deadlock_bids").delete().neq("id", -1).execute()
+    except Exception as e:
+        errors.append(f"deadlock_bids: {e}")
 
-    # Reset auction_state
-    supabase.table("auction_state").update({
-        "phase":             "idle",
-        "is_paused":         False,
-        "current_player_id": None,
-        "current_bid":       None,
-        "current_bid_team":  None,
-        "round":             1,
-        "deadlock_deadline": None,
-        "updated_at":        datetime.now(timezone.utc).isoformat(),
-    }).eq("id", 1).execute()
+    try:
+        # 4. Wipe action_log
+        supabase.table("action_log").delete().neq("id", -1).execute()
+    except Exception as e:
+        errors.append(f"action_log: {e}")
 
-    supabase.table("action_log").insert({
-        "action":  "auction_reset",
-        "payload": {},
-    }).execute()
+    try:
+        # 5. Reset auction_state to clean idle
+        supabase.table("auction_state").update({
+            "phase":             "idle",
+            "is_paused":         False,
+            "current_player_id": None,
+            "current_bid":       None,
+            "current_bid_team":  None,
+            "round":             1,
+            "deadlock_deadline": None,
+            "updated_at":        datetime.now(timezone.utc).isoformat(),
+        }).eq("id", 1).execute()
+    except Exception as e:
+        errors.append(f"auction_state: {e}")
+
+    if errors:
+        return {"ok": False, "error": "Partial reset — errors: " + "; ".join(errors)}
 
     return {"ok": True, "message": "Auction reset successfully"}
 
