@@ -529,7 +529,7 @@ export default function ScoreboardPage() {
           --text:#EEF2FF;--sub:#9CA3AF;--muted:#6B7280;
           --fd:'Bebas Neue',sans-serif;--fu:'Libre Franklin',sans-serif;
         }
-        html,body{height:100%;background:var(--bg);color:var(--text)}
+        html,body{height:100%;height:100dvh;max-height:100dvh;background:var(--bg);color:var(--text);overflow:hidden}
         body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
           background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(255,255,255,0.004) 3px,rgba(255,255,255,0.004) 6px)}
         ::-webkit-scrollbar{width:0;height:0}
@@ -621,16 +621,19 @@ export default function ScoreboardPage() {
 
         /* page: header | player zone | team strip | footer */
         .page{
-          position:relative;z-index:1;height:100vh;
+          position:relative;z-index:1;
+          height:100vh;
+          height:100dvh;
           display:grid;
-          grid-template-rows:125px 1fr 180px 58px;
+          grid-template-rows:110px 1fr 160px 56px;
           overflow:hidden;
+          max-height:100dvh;
         }
 
         /* ── HEADER ── */
-        .hdr{display:flex;align-items:center;justify-content:space-between;padding:0 24px;border-bottom:1px solid var(--border);background:rgba(6,8,16,0.98)}
-        .logo-wrap{display:flex;align-items:center;gap:14px;padding:8px 0}
-        .logo-img{width:95px;height:95px;border-radius:50%;border:1.5px solid rgba(255,215,0,0.3);object-fit:cover}
+        .hdr{display:flex;align-items:center;justify-content:space-between;padding:0 24px;border-bottom:1px solid var(--border);background:rgba(6,8,16,0.98);overflow:hidden;min-height:0}
+        .logo-wrap{display:flex;align-items:center;gap:14px;padding:6px 0}
+        .logo-img{width:88px;height:88px;border-radius:50%;border:1.5px solid rgba(255,215,0,0.3);object-fit:cover;flex-shrink:0}
         .logo-name{font-family:var(--fd);font-size:2.2rem;letter-spacing:2px;color:var(--text);line-height:1}
         .logo-sub{font-family:var(--fu);font-size:0.68rem;font-weight:700;letter-spacing:4px;color:var(--acc);text-transform:uppercase;margin-top:2px}
         .phase-pill{display:flex;align-items:center;gap:6px;padding:5px 14px;border:1px solid}
@@ -963,7 +966,7 @@ export default function ScoreboardPage() {
                         </svg>
                     </div>
 
-                    <div className="page" style={{ overflow: 'hidden' }}>
+                    <div className="page">
                         <header className="hdr">
                             <div className="logo-wrap">
                                 <img className="logo-img" src="/images/tournament-logo.png" alt="" onError={e => e.target.style.display = 'none'} />
