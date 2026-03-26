@@ -13,29 +13,30 @@ export async function middleware(request) {
                     return request.cookies.get(name)?.value
                 },
                 set(name, value, options) {
-                    request.cookies.set({ name, value, ...options })
                     response.cookies.set({ name, value, ...options })
                 },
                 remove(name, options) {
-                    request.cookies.set({ name, value: '', ...options })
                     response.cookies.set({ name, value: '', ...options })
                 },
             },
         }
     )
 
-    const { data: { user } } = await supabase.auth.getUser()
+    // ✅ FAST — no external call
+    const { data: { session } } = await supabase.auth.getSession()
 
-    // If trying to access /admin without a session — redirect to login
-    if (request.nextUrl.pathname.startsWith('/admin') &&
-        !request.nextUrl.pathname.startsWith('/admin/login')) {
-        if (!user) {
-            return NextResponse.redirect(new URL('/admin/login', request.url))
-        }
+    const { pathname } = request.nextUrl
+
+    const isAdminRoute = pathname.startsWith('/admin')
+    const isLoginPage = pathname === '/admin/login'
+
+    // 🚫 Not logged in → redirect to login
+    if (isAdminRoute && !isLoginPage && !session) {
+        return NextResponse.redirect(new URL('/admin/login', request.url))
     }
 
-    // If already logged in and hitting /admin/login — redirect to dashboard
-    if (request.nextUrl.pathname === '/admin/login' && user) {
+    // 🔁 Already logged in → avoid login page
+    if (isLoginPage && session) {
         return NextResponse.redirect(new URL('/admin', request.url))
     }
 
@@ -43,5 +44,5 @@ export async function middleware(request) {
 }
 
 export const config = {
-    matcher: ['/overlay', '/admin', '/admin/:path*'],
+    matcher: ['/admin/:path*'],
 }
