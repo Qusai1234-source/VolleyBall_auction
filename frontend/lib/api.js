@@ -28,6 +28,10 @@ async function del(path, body) {
     if (!res.ok) throw new Error('Request failed')
     return res.json()
 }
+const defaultHeaders = {
+    'Content-Type': 'application/json',
+    'ngrok-skip-browser-warning': 'true',   // ← add this
+}
 
 export const api = {
     // ── Auction ──────────────────────────────────────────────
