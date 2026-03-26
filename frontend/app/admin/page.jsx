@@ -127,19 +127,10 @@ export default function AdminDashboard() {
     // keyboard bid flash feedback
     const [kbFlash, setKbFlash] = useState(null) // { teamId, key }
     const kbFlashRef = useRef(null)
-    const [kbBlocked, setKbBlocked] = useState(null) // { teamId } — quota/wallet block
-    const kbBlockedRef = useRef(null)
-    const kbBusyRef = useRef(false) // debounce rapid keypresses
+    // localBidRef: tracks bid optimistically so rapid keypresses increment correctly
+    // without waiting for astate to update from DB/broadcast
+    const localBidRef = useRef(0)
     const isActiveRef = useRef(false) // ref so keydown handler always sees current value
-
-    // Refs so Enter/Space/1-5 handlers always see current values without stale closures
-    const bidAmountRef = useRef('')
-    const winTeamIdRef = useRef('')
-    const astateRef = useRef(null)
-    const allTeamsRef = useRef([])
-    const allPlayersRef = useRef([])
-    const bidWarningRef = useRef(null)
-    const doActionRef = useRef(null)
     const [searchQuery, setSearchQuery] = useState('')
     const [searchPreview, setSearchPreview] = useState(null) // player object being previewed
     const searchInputRef = useRef(null)
@@ -167,12 +158,15 @@ export default function AdminDashboard() {
     // reset bid controls when player changes -- seed amount with current bid or base price
     useEffect(() => {
         if (astate?.current_player) {
-            setBidAmount(String(astate.current_bid || astate.current_player.base_price || ''))
+            const seed = astate.current_bid || astate.current_player.base_price || 0
+            setBidAmount(String(seed))
+            localBidRef.current = seed   // seed local tracker too
             // clear search state once a player is on the block
             setSearchPreview(null)
             setSearchQuery('')
         } else {
             setBidAmount('')
+            localBidRef.current = 0
         }
         setWinTeamId('')
     }, [astate?.current_player_id])
@@ -224,6 +218,10 @@ export default function AdminDashboard() {
                 } : prev)
                 setBidAmount(String(payload.current_bid))
                 setWinTeamId(payload.current_bid_team_id)
+                // keep local tracker in sync with confirmed broadcasts
+                if (payload.current_bid > localBidRef.current) {
+                    localBidRef.current = payload.current_bid
+                }
             })
             // postgres_changes: fallback sync for non-bid state changes
             .on('postgres_changes', { event: '*', schema: 'public', table: 'auction_state' },
@@ -251,7 +249,6 @@ export default function AdminDashboard() {
         } catch { showToast('Network error', 'error') }
         finally { setBusy(b => ({ ...b, [key]: false })) }
     }
-    doActionRef.current = doAction
 
     const pullPlayer = () => {
         if (searchPreview) {
@@ -319,138 +316,56 @@ export default function AdminDashboard() {
         return 1000 // diamond / other: safe fallback
     }, [])
 
-    // Fixed increment map for keys 1-5
-    const FIXED_INC_MAP = { '1': 1000, '2': 2000, '3': 3000, '4': 4000, '5': 5000 }
-
     useEffect(() => {
-        const handler = async (e) => {
+        const handler = (e) => {
             if (!isActiveRef.current) return
-
-            // Never steal keypresses when the search input is focused
-            if (document.activeElement === searchInputRef.current) return
-
             const key = e.key.toLowerCase()
-            const rawKey = e.key // preserve case for digit detection
-
-            // ── Enter → Confirm Sold ───────────────────────────────────────
-            if (e.key === 'Enter') {
-                e.preventDefault()
-                const tid = winTeamIdRef.current
-                const amt = parseInt(bidAmountRef.current)
-                if (!tid || !amt) { showToast('Select team and enter bid amount first', 'error'); return }
-                // Re-read astate from ref to avoid stale closure
-                const snap = astateRef.current
-                doActionRef.current('sold', '/auction/sold', {
-                    player_id: snap?.current_player_id,
-                    team_id: tid,
-                    amount: amt,
-                })
-                return
-            }
-
-            // ── Space → Update Bid ─────────────────────────────────────────
-            if (e.key === ' ') {
-                e.preventDefault()
-                const tid = winTeamIdRef.current
-                const amt = parseInt(bidAmountRef.current)
-                if (!tid) { showToast('Select a team first', 'error'); return }
-                if (!amt || isNaN(amt)) { showToast('Enter a valid bid amount', 'error'); return }
-                if (bidWarningRef.current) { showToast(bidWarningRef.current, 'error'); return }
-                doActionRef.current('updatebid', '/auction/assign-opening-bid', {
-                    team_id: tid, amount: amt,
-                })
-                return
-            }
-
-            // ── 1-5 → Fixed increment on selected team ─────────────────────
-            const fixedInc = FIXED_INC_MAP[rawKey]
-            if (fixedInc) {
-                e.preventDefault()
-                const tid = winTeamIdRef.current
-                if (!tid) { showToast('Select a team first to use increment keys', 'error'); return }
-                if (kbBusyRef.current) return
-                kbBusyRef.current = true
-
-                const snap = astateRef.current
-                const teams = allTeamsRef.current
-                const players = allPlayersRef.current
-                const team = teams.find(t => t.id === tid)
-                if (!team) { kbBusyRef.current = false; return }
-
-                const currentBid = snap?.current_bid || snap?.current_player?.base_price || 0
-                const cls = snap?.current_player?.cls
-                const newBid = currentBid + fixedInc
-
-                // All block checks
-                const tSquad = players.filter(p => p.status === 'sold' && p.sold_to_team === team.id)
-                const fireBlocked = (reason) => {
-                    setKbBlocked({ teamId: team.id })
-                    clearTimeout(kbBlockedRef.current)
-                    kbBlockedRef.current = setTimeout(() => setKbBlocked(null), 600)
-                    showToast(`${team.name} — ${reason}`, 'error')
-                    kbBusyRef.current = false
-                }
-                const MAX_SQUAD = team.max_players ?? 8
-                if ((team.players_bought ?? 0) >= MAX_SQUAD) { fireBlocked('squad full (8/8)'); return }
-                const currentClass = normaliseClass(cls)
-                if (currentClass === 'gold' && tSquad.filter(p => normaliseClass(p.cls) === 'gold').length >= 2) { fireBlocked('gold quota full (2/2)'); return }
-                if (currentClass === 'silver' && tSquad.filter(p => normaliseClass(p.cls) === 'silver').length >= 5) { fireBlocked('silver quota full (5/5)'); return }
-                const maxSafe = calcMaxBid(team, currentClass, tSquad)
-                if (newBid > maxSafe) { fireBlocked(`max bid reached (${fmtFull(maxSafe)})`); return }
-
-                // Only update local bid input — admin presses Space to commit
-                setBidAmount(String(newBid))
-                kbBusyRef.current = false
-                return
-            }
-
-            // ── Team letter keys → bid increment for that team ─────────────
             const teamNameFragment = TEAM_KEY_MAP[key]
             if (!teamNameFragment) return
 
-            const team = allTeamsRef.current.find(t => t.name.toLowerCase() === teamNameFragment)
+            const team = allTeams.find(t => t.name.toLowerCase() === teamNameFragment)
             if (!team) return
 
-            if (kbBusyRef.current) return
-            kbBusyRef.current = true
+            // use localBidRef — always current even at 4+ bids/sec
+            // astate.current_bid lags behind; localBidRef advances optimistically
+            const cls = astate?.current_player?.cls
+            const inc = getKbIncrement(cls, localBidRef.current)
+            const newBid = localBidRef.current + inc
 
-            const snap = astateRef.current
-            const players = allPlayersRef.current
-            const currentBid = snap?.current_bid || snap?.current_player?.base_price || 0
-            const cls = snap?.current_player?.cls
-            const inc = getKbIncrement(cls, currentBid)
-            const newBid = currentBid + inc
-
-            // All block checks
-            const tSquad = players.filter(p => p.status === 'sold' && p.sold_to_team === team.id)
-            const fireBlocked = (reason) => {
-                setKbBlocked({ teamId: team.id })
-                clearTimeout(kbBlockedRef.current)
-                kbBlockedRef.current = setTimeout(() => setKbBlocked(null), 600)
-                showToast(`${team.name} — ${reason}`, 'error')
-                kbBusyRef.current = false
+            // wallet + max safe bid guard
+            if (newBid > team.wallet) {
+                showToast(`${team.name} — wallet exceeded`, 'error')
+                return
             }
-            const MAX_SQUAD = team.max_players ?? 8
-            if ((team.players_bought ?? 0) >= MAX_SQUAD) { fireBlocked('squad full (8/8)'); return }
-            const currentClass = normaliseClass(cls)
-            if (currentClass === 'gold' && tSquad.filter(p => normaliseClass(p.cls) === 'gold').length >= 2) { fireBlocked('gold quota full (2/2)'); return }
-            if (currentClass === 'silver' && tSquad.filter(p => normaliseClass(p.cls) === 'silver').length >= 5) { fireBlocked('silver quota full (5/5)'); return }
-            const maxSafe = calcMaxBid(team, currentClass, tSquad)
-            if (newBid > maxSafe) { fireBlocked(`max bid reached (${fmtFull(maxSafe)})`); return }
+            const tSquad = allPlayers.filter(p => p.status === 'sold' && p.sold_to_team === team.id)
+            const maxSafe = calcMaxBid(team, normaliseClass(cls), tSquad)
+            if (newBid > maxSafe) {
+                showToast(`${team.name} — max safe bid (${fmtFull(maxSafe)})`, 'error')
+                return
+            }
 
-            // Flash + update
+            // advance local tracker immediately — next keypress sees updated value instantly
+            localBidRef.current = newBid
+
+            // flash feedback
             setKbFlash({ teamId: team.id, key: key.toUpperCase() })
             clearTimeout(kbFlashRef.current)
             kbFlashRef.current = setTimeout(() => setKbFlash(null), 600)
+
+            // update UI immediately
             setBidAmount(String(newBid))
             setWinTeamId(team.id)
+
+            // 1. Broadcast via WebSocket (~10-50ms to all clients) — fire and forget
             broadcastBid(team.id, newBid)
-            persistBid(team.id, newBid).finally(() => { kbBusyRef.current = false })
+
+            // 2. Persist to DB — fully async, never blocks next keypress
+            persistBid(team.id, newBid)
         }
 
         window.addEventListener('keydown', handler)
         return () => window.removeEventListener('keydown', handler)
-    }, [showToast, getKbIncrement, broadcastBid, persistBid])
+    }, [astate, allTeams, getKbIncrement, showToast])
     const markUnsold = () => doAction('unsold', '/auction/unsold')
 
     // ── Undo: fetch preview first, show confirm, then fire ─────────────────
@@ -552,13 +467,6 @@ export default function AdminDashboard() {
     const currentPlayer = astate?.current_player
     const leadingTeam = allTeams.find(t => t.id === astate?.current_bid_team_id)
 
-    // Keep refs in sync so keyboard handlers never read stale state
-    astateRef.current = astate
-    allTeamsRef.current = allTeams
-    allPlayersRef.current = allPlayers
-    bidAmountRef.current = bidAmount
-    winTeamIdRef.current = winTeamId
-
     const poolPlayers = allPlayers.filter(p =>
         poolFilter === 'available' ? p.status === 'upcoming'
             : poolFilter === 'unsold' ? p.status === 'unsold'
@@ -599,7 +507,6 @@ export default function AdminDashboard() {
         if (bidAmt > calcMaxBid(t, currentClass, tSq)) return `Exceeds ${t.name}'s max safe bid (${fmtFull(calcMaxBid(t, currentClass, tSq))}) — not enough left`
         return null
     })()
-    bidWarningRef.current = bidWarning
 
     if (loading) return (
         <div style={{ minHeight: '100vh', background: '#060810', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 14 }}>
@@ -685,12 +592,6 @@ export default function AdminDashboard() {
           100%{ box-shadow: 0 0 0 0 rgba(255,215,0,0); }
         }
         .kb-flash { animation: kbFlash 0.55s ease-out forwards !important; }
-        @keyframes kbBlocked {
-          0%  { box-shadow: 0 0 0 0 rgba(248,113,113,0.8); border-color: rgba(248,113,113,0.9); background: rgba(248,113,113,0.18) }
-          60% { box-shadow: 0 0 0 8px rgba(248,113,113,0); }
-          100%{ box-shadow: 0 0 0 0 rgba(248,113,113,0); }
-        }
-        .kb-blocked { animation: kbBlocked 0.55s ease-out forwards !important; }
         .kb-key{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid rgba(255,215,0,0.3);background:rgba(255,215,0,0.06);font-family:var(--mono);font-size:0.58rem;color:var(--acc);border-radius:2px;flex-shrink:0}
 
         /* hotkey legend bar */
@@ -902,22 +803,6 @@ export default function AdminDashboard() {
                                     </div>
                                 )
                             })}
-                            <div style={{ width: 1, height: 14, background: 'var(--border2)', margin: '0 2px' }} />
-                            {[1, 2, 3, 4, 5].map(n => (
-                                <div key={n} className="kb-legend-item">
-                                    <span className="kb-key">{n}</span>
-                                    <span>+{n}K</span>
-                                </div>
-                            ))}
-                            <div style={{ width: 1, height: 14, background: 'var(--border2)', margin: '0 2px' }} />
-                            <div className="kb-legend-item">
-                                <span className="kb-key" style={{ width: 'auto', padding: '0 5px', borderColor: 'rgba(251,146,60,0.35)', background: 'rgba(251,146,60,0.06)', color: 'var(--orange)' }}>SPC</span>
-                                <span>Update Bid</span>
-                            </div>
-                            <div className="kb-legend-item">
-                                <span className="kb-key" style={{ width: 'auto', padding: '0 5px', borderColor: 'rgba(74,222,128,0.35)', background: 'rgba(74,222,128,0.06)', color: 'var(--green)' }}>ENT</span>
-                                <span>Confirm Sold</span>
-                            </div>
                         </div>
                     </div>
 
@@ -1007,6 +892,7 @@ export default function AdminDashboard() {
                                             placeholder="Enter amount"
                                             value={bidAmount}
                                             onChange={e => setBidAmount(e.target.value)}
+                                            onKeyDown={e => e.key === 'Enter' && updateBid()}
                                             min={0}
                                         />
                                     </div>
@@ -1053,7 +939,7 @@ export default function AdminDashboard() {
                                                     key={t.id}
                                                     onClick={() => setWinTeamId(isSelected ? '' : t.id)}
                                                     disabled={!isActive || isTeamClassLocked(t.id)}
-                                                    className={kbFlash?.teamId === t.id ? 'kb-flash' : kbBlocked?.teamId === t.id ? 'kb-blocked' : ''}
+                                                    className={kbFlash?.teamId === t.id ? 'kb-flash' : ''}
                                                     style={{
                                                         background: isSelected ? 'rgba(255,215,0,0.1)' : 'var(--bg-panel)',
                                                         border: `1px solid ${isSelected ? 'rgba(255,215,0,0.55)' : 'var(--border2)'}`,

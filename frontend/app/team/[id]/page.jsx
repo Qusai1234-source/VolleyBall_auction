@@ -322,6 +322,66 @@ const getTeamGradient = (teamId) => {
 // ══════════════════════════════════════════════════════════════════════════════
 const supabase = createClient()
 
+function RosterModal({ team, roster, onClose }) {
+    const totalSpent = (roster || []).reduce((s, p) => normaliseClass(p.cls) === 'diamond' ? s : s + (p.sold_price || 0), 0)
+    const colour = teamColour(team.id), rgb = hexToRgb(colour)
+    const [imgErr, setImgErr] = useState(false)
+    return (
+        <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(6,8,16,0.92)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <div onClick={e => e.stopPropagation()} style={{ background: '#0D1117', border: `1px solid rgba(${rgb},0.25)`, width: 560, maxWidth: '90vw', maxHeight: '82vh', display: 'flex', flexDirection: 'column', boxShadow: `0 20px 80px rgba(0,0,0,0.9),0 0 40px rgba(${rgb},0.1)`, animation: 'fadeUp 0.3s ease-out' }}>
+                <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border2)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: `linear-gradient(90deg,transparent 40%,rgba(${rgb},0.1) 100%)` }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+                        <div style={{ width: 48, height: 48, borderRadius: '50%', overflow: 'hidden', border: `2px solid rgba(${rgb},0.5)`, boxShadow: `0 0 16px rgba(${rgb},0.3)`, background: `rgba(${rgb},0.15)` }}>
+                            {!imgErr
+                                ? <img src={`/images/teams/${team.id}.png`} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={() => setImgErr(true)} />
+                                : <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--fd)', fontSize: '1.5rem', color: colour }}>{team.name.charAt(0)}</div>
+                            }
+                        </div>
+                        <div>
+                            <div style={{ fontFamily: 'var(--fd)', fontSize: '1.7rem', letterSpacing: '1px', color: 'var(--text)', lineHeight: 1 }}>{team.name}</div>
+                            <div style={{ fontFamily: 'var(--fu)', fontSize: '0.7rem', fontWeight: 600, letterSpacing: '2px', color: 'var(--sub)', marginTop: 5 }}>{(roster || []).length} players · {fmtFull(team.wallet)} remaining</div>
+                        </div>
+                    </div>
+                    <button onClick={onClose} style={{ background: 'none', border: '1px solid var(--border2)', cursor: 'pointer', width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)', transition: 'all 0.2s' }}
+                        onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(248,113,113,0.5)'; e.currentTarget.style.color = 'var(--red)' }}
+                        onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border2)'; e.currentTarget.style.color = 'var(--muted)' }}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                    </button>
+                </div>
+                <div style={{ overflowY: 'auto', flex: 1 }}>
+                    {(!roster || roster.length === 0)
+                        ? <div style={{ padding: '60px 32px', textAlign: 'center', fontFamily: 'var(--fu)', fontSize: '0.7rem', letterSpacing: '3px', color: 'var(--muted)', textTransform: 'uppercase' }}>No players yet</div>
+                        : roster.map(p => {
+                            const ps = posStyle(p.position), cc = classCfg(p.cls)
+                            return (
+                                <div key={p.id} style={{ display: 'grid', gridTemplateColumns: '80px 1fr auto', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                                    <div style={{ background: 'var(--bg-panel)', overflow: 'hidden' }}>
+                                        <img src={p.photo_url || `/images/players/${p.id}.jpg`} alt="" style={{ width: 80, height: 96, objectFit: 'cover', objectPosition: 'top', display: 'block' }} onError={e => e.target.style.display = 'none'} />
+                                    </div>
+                                    <div style={{ padding: '10px 16px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 6 }}>
+                                        <div style={{ fontFamily: 'var(--fd)', fontSize: '1.2rem', color: 'var(--text)' }}>{p.name}</div>
+                                        <div style={{ display: 'flex', gap: 6 }}>
+                                            <span style={{ fontFamily: 'var(--fu)', fontSize: '0.62rem', fontWeight: 700, letterSpacing: '2px', textTransform: 'uppercase', padding: '2px 8px', background: ps.bg, border: `1px solid ${ps.border}`, color: ps.text }}>{ps.label || p.position}</span>
+                                            <span style={{ fontFamily: 'var(--fu)', fontSize: '0.62rem', fontWeight: 700, letterSpacing: '2px', textTransform: 'uppercase', padding: '2px 8px', background: cc.bg, border: `1px solid ${cc.border}`, color: cc.color }}>{cc.label || p.cls}</span>
+                                        </div>
+                                    </div>
+                                    <div style={{ padding: '10px 16px', borderLeft: '1px solid var(--border2)', display: 'flex', alignItems: 'center' }}>
+                                        <div style={{ fontFamily: 'var(--fd)', fontSize: '1.2rem', color: normaliseClass(p.cls) === 'diamond' ? '#67E8F9' : 'var(--acc)' }}>{normaliseClass(p.cls) === 'diamond' ? 'Retained' : fmt(p.sold_price)}</div>
+                                    </div>
+                                </div>
+                            )
+                        })
+                    }
+                </div>
+                <div style={{ padding: '12px 20px', borderTop: '1px solid var(--border2)', display: 'flex', justifyContent: 'space-between', background: `rgba(${rgb},0.04)` }}>
+                    <div style={{ fontFamily: 'var(--fu)', fontSize: '0.65rem', fontWeight: 700, letterSpacing: '3px', color: 'var(--muted)', textTransform: 'uppercase' }}>Total Spent</div>
+                    <div style={{ fontFamily: 'var(--fd)', fontSize: '1.3rem', color: 'var(--acc)' }}>{fmtFull(totalSpent)}</div>
+                </div>
+            </div>
+        </div>
+    )
+}
+
 export default function TeamRosterPage() {
     const { id: teamId } = useParams()
     const router = useRouter()
@@ -339,6 +399,11 @@ export default function TeamRosterPage() {
     const [posFilter, setPosFilter] = useState('all')
     const [clsFilter, setClsFilter] = useState('all')
     const [wlBusy, setWlBusy] = useState({})
+
+    // Roster Modal state
+    const [activeRosterTeam, setActiveRosterTeam] = useState(null)
+    const [rosterPlayers, setRosterPlayers] = useState([])
+    const [fetchingRoster, setFetchingRoster] = useState(false)
 
     const [toast, setToast] = useState(null)
     const toastRef = useRef(null)
@@ -1324,14 +1389,29 @@ export default function TeamRosterPage() {
                                 const isMe = String(t.id) === String(teamId)
                                 const pct = Math.min(100, Math.round((t.wallet / STARTING_WALLET) * 100))
                                 return (
-                                    <div key={t.id} className={`sb-tr ${isMe ? 'me' : ''}`} style={{
-                                        transition: 'all 0.4s ease',
-                                        ...(isMe ? {
-                                            background: `linear-gradient(90deg, rgba(${hexToRgb(teamColour(t.id))}, 0.25), #000000)`,
-                                            border: `1px solid rgba(${hexToRgb(teamColour(t.id))}, 0.4)`,
-                                            boxShadow: `0 0 20px rgba(${hexToRgb(teamColour(t.id))}, 0.3)`
-                                        } : {})
-                                    }}>
+                                    <div
+                                        key={t.id}
+                                        className={`sb-tr ${isMe ? 'me' : ''}`}
+                                        onClick={async () => {
+                                            setActiveRosterTeam(t)
+                                            setRosterPlayers([])
+                                            setFetchingRoster(true)
+                                            try {
+                                                const r = await fetch(`${API}/teams/${t.id}/roster`)
+                                                if (r.ok) setRosterPlayers(await r.json())
+                                            } catch { }
+                                            setFetchingRoster(false)
+                                        }}
+                                        style={{
+                                            cursor: 'pointer',
+                                            transition: 'all 0.4s ease',
+                                            ...(isMe ? {
+                                                background: `linear-gradient(90deg, rgba(${hexToRgb(teamColour(t.id))}, 0.25), #000000)`,
+                                                border: `1px solid rgba(${hexToRgb(teamColour(t.id))}, 0.4)`,
+                                                boxShadow: `0 0 20px rgba(${hexToRgb(teamColour(t.id))}, 0.3)`
+                                            } : {})
+                                        }}
+                                    >
                                         <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
                                             {/* rank number */}
                                             <div style={{ fontFamily: 'var(--fd)', fontSize: '0.85rem', color: i === 0 ? 'var(--acc)' : 'var(--muted)', width: 16, flexShrink: 0, textAlign: 'center', lineHeight: 1 }}>{i + 1}</div>
@@ -1472,6 +1552,15 @@ export default function TeamRosterPage() {
                     </div>
                 )
             })()}
+
+            {/* ── ROSTER MODAL ── */}
+            {activeRosterTeam && (
+                <RosterModal
+                    team={activeRosterTeam}
+                    roster={rosterPlayers}
+                    onClose={() => setActiveRosterTeam(null)}
+                />
+            )}
         </>
     )
 }

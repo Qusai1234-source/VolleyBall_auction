@@ -209,7 +209,53 @@ def undo_last():
     except Exception as e:
         return {"ok": False, "error": f"Undo error: {str(e)}"}
 
+
+def get_undo_preview():
+    supabase = get_supabase()
+    try:
+        res = supabase.table("action_log") \
+            .select("*") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if not res.data:
+            return {"action": None, "description": "No actions to undo."}
+
+        log = res.data[0]
+        return {
+            "ok": True,
+            "action": log.get("action"),
+            "payload": log.get("payload"),
+            "created_at": log.get("created_at")
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def get_reset_preview():
+    supabase = get_supabase()
+    try:
+        # Get counts for reset preview
+        sold_res = supabase.table("players").select("id", count="exact")\
+            .eq("status", "sold").neq("class", "Diamond").execute()
+        bids_res = supabase.table("bids").select("id", count="exact").execute()
+        log_res  = supabase.table("action_log").select("id", count="exact").execute()
+        teams_res = supabase.table("teams").select("id").execute()
+
+        return {
+            "ok": True,
+            "sold_players": sold_res.count or 0,
+            "bids": bids_res.count or 0,
+            "log_entries": log_res.count or 0,
+            "teams": teams_res.data or []
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def reset_auction():
+
     supabase = get_supabase()
     errors = []
 

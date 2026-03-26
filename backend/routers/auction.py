@@ -139,6 +139,17 @@ def undo():
     return auction_service.undo_last()
 
 
+@router.get("/undo-preview")
+def undo_preview():
+    return auction_service.get_undo_preview()
+
+
+@router.get("/reset-preview")
+def reset_preview():
+    return auction_service.get_reset_preview()
+
+
+
 @router.post("/assign-opening-bid")
 def assign_opening_bid(body: AssignOpeningBidRequest):
     supabase = get_supabase()
